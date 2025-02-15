@@ -1,2 +1,4 @@
-# Bayer_Low_light_Image_Enhancement
-Bayer_Low_light_Image_Enhancement
+# Bayer-LLIE
+Bayer low light image Enh
+
+![WaveTransformBlock](./images/image_1.png )
