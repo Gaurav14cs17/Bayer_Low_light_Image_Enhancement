@@ -1,195 +1,171 @@
-import argparse
-import os
-import time
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
+from torch.utils.data import DataLoader
+import torch.optim as optim
+from skimage.metrics import peak_signal_noise_ratio as PSNR
+from warmup_scheduler import GradualWarmupScheduler
 from torch.utils.tensorboard import SummaryWriter
-from tqdm import tqdm
+import numpy as np
+import os
+import tqdm
+import glob
+import time
+import datetime
+from model import RawFormer
+from load_dataset import load_data_MCR, load_data_SID
 
+# Configuration
+config = {
+    'gpu_id': '0',
+    'base_lr': 1e-4,
+    'batch_size': 16,
+    'dataset': 'SID',  # 'SID' or 'MCR'
+    'patch_size': 512,
+    'model_size': 'S',  # 'S', 'B', or 'L'
+    'epochs': 3000,
+    'warmup_epochs': 20,
+    'min_lr': 1e-5
+}
 
-# Simple metric tracker
-class MetricTracker:
-    def __init__(self):
-        self.reset()
+# Setup directories
+result_dir = os.path.join('result', config['dataset'])
+os.makedirs(result_dir, exist_ok=True)
+weights_dir = os.path.join(result_dir, 'weights')
+os.makedirs(weights_dir, exist_ok=True)
+logs_dir = os.path.join(result_dir, 'logs')
+os.makedirs(logs_dir, exist_ok=True)
 
-    def reset(self):
-        self.val = 0
-        self.avg = 0
-        self.sum = 0
-        self.count = 0
+# Device setup
+os.environ["CUDA_VISIBLE_DEVICES"] = config['gpu_id']
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f'Using device: {device}')
 
-    def update(self, val, n=1):
-        self.val = val
-        self.sum += val * n
-        self.count += n
-        self.avg = self.sum / self.count
+# Model initialization
+model_dim = {'S': 32, 'B': 48, 'L': 64}[config['model_size']]
+model = RawFormer(dim=model_dim).to(device)
 
+# Print model info
+total_params = sum(p.numel() for p in model.parameters())
+trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+print(f'\nTrainable parameters: {trainable_params:,}\nTotal parameters: {total_params:,}\n')
 
-# Loss function wrapper
-class MultiLoss(nn.Module):
-    def __init__(self, losses, weights):
-        super().__init__()
-        self.losses = nn.ModuleList(losses)
-        self.weights = weights
+# Dataset loading
+def load_dataset():
+    if config['dataset'] == 'SID':
+        train_input = glob.glob('Sony/short/0*_00_0.1s.ARW') + glob.glob('Sony/short/2*_00_0.1s.ARW')
+        train_gt = [glob.glob(f'Sony/long/*{x[-17:-12]}*.ARW')[0] for x in train_input]
+        test_input = glob.glob('Sony/short/1*_00_0.1s.ARW')
+        test_gt = [glob.glob(f'Sony/long/*{x[-17:-12]}*.ARW')[0] for x in test_input]
+        
+        train_data = load_data_SID(train_input, train_gt, config['patch_size'], True)
+        test_data = load_data_SID(test_input, test_gt, config['patch_size'], False)
+    else:
+        train_c = np.load('Mono_Colored_RAW_Paired_DATASET/random_path_list/train/train_c_path.npy')[:32]
+        train_rgb = np.load('Mono_Colored_RAW_Paired_DATASET/random_path_list/train/train_rgb_path.npy')[:32]
+        test_c = np.load('Mono_Colored_RAW_Paired_DATASET/random_path_list/test/test_c_path.npy')[:32]
+        test_rgb = np.load('Mono_Colored_RAW_Paired_DATASET/random_path_list/test/test_rgb_path.npy')[:32]
+        
+        train_data = load_data_MCR(train_c, train_rgb, config['patch_size'], True)
+        test_data = load_data_MCR(test_c, test_rgb, config['patch_size'], False)
+    
+    return train_data, test_data
 
-    def forward(self, preds, targets):
-        total = 0
-        for loss, w, p, t in zip(self.losses, self.weights, preds, targets):
-            total += loss(p, t) * w
-        return total
+train_data, test_data = load_dataset()
+train_loader = DataLoader(train_data, batch_size=config['batch_size'], shuffle=True, num_workers=16, pin_memory=True)
+test_loader = DataLoader(test_data, batch_size=config['batch_size'], shuffle=False, num_workers=16, pin_memory=True)
+print(f'Train batches: {len(train_loader)}, Test batches: {len(test_loader)}')
 
+# Training setup
+criterion = nn.L1Loss()
+optimizer = optim.Adam(model.parameters(), lr=config['base_lr'])
 
-# Image quality metrics
-def psnr(pred, target, max_val=255.0):
-    mse = torch.mean((pred - target) ** 2, dim=[1, 2, 3])
-    return 20 * torch.log10(max_val / torch.sqrt(mse))
+# Learning rate scheduling
+scheduler_cosine = optim.lr_scheduler.CosineAnnealingLR(
+    optimizer, config['epochs']-config['warmup_epochs'], eta_min=config['min_lr'])
+scheduler = GradualWarmupScheduler(
+    optimizer, multiplier=1, total_epoch=config['warmup_epochs'], after_scheduler=scheduler_cosine)
 
+# Mixed precision training
+scaler = torch.cuda.amp.GradScaler()
 
-def ssim(pred, target, max_val=255.0, window_size=11):
-    # Simple SSIM implementation (for actual use, consider a proper implementation)
-    C1 = (0.01 * max_val) ** 2
-    C2 = (0.03 * max_val) ** 2
+# TensorBoard writer
+writer = SummaryWriter(log_dir=logs_dir)
 
-    mu_x = F.avg_pool2d(pred, window_size, 1, window_size // 2)
-    mu_y = F.avg_pool2d(target, window_size, 1, window_size // 2)
+# Training loop
+best_psnr = 0
+best_epoch = 0
 
-    sigma_x = F.avg_pool2d(pred ** 2, window_size, 1, window_size // 2) - mu_x ** 2
-    sigma_y = F.avg_pool2d(target ** 2, window_size, 1, window_size // 2) - mu_y ** 2
-    sigma_xy = F.avg_pool2d(pred * target, window_size, 1, window_size // 2) - mu_x * mu_y
-
-    ssim_map = ((2 * mu_x * mu_y + C1) * (2 * sigma_xy + C2)) / (
-                (mu_x ** 2 + mu_y ** 2 + C1) * (sigma_x + sigma_y + C2))
-    return ssim_map.mean(dim=[1, 2, 3])
-
-
-# Main training class
-class Trainer:
-    def __init__(self, config):
-        self.config = config
-        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-
-        # Setup directories
-        os.makedirs(config['output'], exist_ok=True)
-        os.makedirs(os.path.join(config['output'], 'checkpoints'), exist_ok=True)
-
-        # Initialize components
-        self.model = self._init_model().to(self.device)
-        self.optimizer = torch.optim.AdamW(
-            self.model.parameters(),
-            lr=config['lr'],
-            weight_decay=config['weight_decay']
-        )
-        self.criterion = MultiLoss(
-            [nn.MSELoss(), nn.L1Loss()],
-            config['loss_weights']
-        )
-        self.writer = SummaryWriter(os.path.join(config['output'], 'logs'))
-
-        print(f"Training on {self.device}")
-
-    def _init_model(self):
-        # Replace with actual model initialization
-        return nn.Identity()  # Dummy model
-
-    def train(self, train_loader, val_loader, epochs):
-        best_psnr = 0
-
-        for epoch in range(1, epochs + 1):
-            # Training phase
-            self.model.train()
-            train_loss = MetricTracker()
-
-            for batch in tqdm(train_loader, desc=f"Train Epoch {epoch}"):
-                inputs = batch['input'].to(self.device)
-                targets = [batch['target1'].to(self.device), batch['target2'].to(self.device)]
-
-                self.optimizer.zero_grad()
-                outputs = self.model(inputs)
-                loss = self.criterion(outputs, targets)
-                loss.backward()
-                self.optimizer.step()
-
-                train_loss.update(loss.item(), inputs.size(0))
-
-            # Validation phase
-            val_psnr, val_ssim = self.validate(val_loader)
-
-            # Save checkpoint
-            if val_psnr > best_psnr:
-                best_psnr = val_psnr
-                self.save_checkpoint(epoch, best=True)
-
-            self.save_checkpoint(epoch)
-
-            # Log metrics
-            print(f"Epoch {epoch}: "
-                  f"Train Loss: {train_loss.avg:.4f}, "
-                  f"Val PSNR: {val_psnr:.2f}, "
-                  f"Val SSIM: {val_ssim:.4f}")
-
-            self.writer.add_scalar('Loss/train', train_loss.avg, epoch)
-            self.writer.add_scalar('PSNR/val', val_psnr, epoch)
-            self.writer.add_scalar('SSIM/val', val_ssim, epoch)
-
-    def validate(self, loader):
-        self.model.eval()
-        psnr_tracker = MetricTracker()
-        ssim_tracker = MetricTracker()
-
-        with torch.no_grad():
-            for batch in tqdm(loader, desc="Validating"):
-                inputs = batch['input'].to(self.device)
-                targets = batch['target'].to(self.device)
-
-                outputs = self.model(inputs)[0]  # Get first output
-                outputs = torch.clamp(outputs, 0, 1) * 255
-                targets = torch.clamp(targets, 0, 1) * 255
-
-                psnr_tracker.update(psnr(outputs, targets).mean().item())
-                ssim_tracker.update(ssim(outputs, targets).mean().item())
-
-        return psnr_tracker.avg, ssim_tracker.avg
-
-    def save_checkpoint(self, epoch, best=False):
-        state = {
+print("Starting training at:", datetime.datetime.now().isoformat())
+for epoch in range(config['epochs']):
+    epoch_start = time.time()
+    model.train()
+    epoch_loss = 0
+    
+    # Training phase
+    for inputs, targets in tqdm.tqdm(train_loader, desc=f'Epoch {epoch}'):
+        inputs, targets = inputs.to(device), targets.to(device)
+        
+        optimizer.zero_grad()
+        with torch.cuda.amp.autocast():
+            outputs = model(inputs)
+            loss = criterion(outputs, targets)
+        
+        scaler.scale(loss).backward()
+        scaler.step(optimizer)
+        scaler.update()
+        epoch_loss += loss.item()
+    
+    scheduler.step()
+    
+    # Validation phase
+    model.eval()
+    psnr_values = []
+    with torch.no_grad():
+        for inputs, targets in tqdm.tqdm(test_loader, desc='Validating'):
+            inputs, targets = inputs.to(device), targets.to(device)
+            
+            with torch.cuda.amp.autocast():
+                outputs = model(inputs)
+                outputs = torch.clamp(outputs, 0, 1)
+            
+            # Convert to numpy and calculate PSNR
+            outputs_np = (outputs.cpu().numpy().transpose(0, 2, 3, 1) * 255).astype(np.uint8)
+            targets_np = (targets.cpu().numpy().transpose(0, 2, 3, 1) * 255).astype(np.uint8)
+            psnr_values.extend([PSNR(t, o) for t, o in zip(targets_np, outputs_np)])
+    
+    avg_psnr = np.mean(psnr_values)
+    
+    # Save best model
+    if avg_psnr > best_psnr:
+        best_psnr = avg_psnr
+        best_epoch = epoch
+        torch.save({
             'epoch': epoch,
-            'model': self.model.state_dict(),
-            'optimizer': self.optimizer.state_dict(),
-        }
+            'state_dict': model.state_dict(),
+            'optimizer': optimizer.state_dict()
+        }, os.path.join(weights_dir, "model_best.pth"))
+    
+    # Logging
+    epoch_time = time.time() - epoch_start
+    current_lr = scheduler.get_lr()[0]
+    
+    print(f"\nEpoch {epoch}:")
+    print(f"Time: {epoch_time:.2f}s | Loss: {epoch_loss/len(train_loader):.4f}")
+    print(f"PSNR: {avg_psnr:.4f} | Best PSNR: {best_psnr:.4f} (epoch {best_epoch})")
+    print(f"Learning Rate: {current_lr:.6f}")
+    
+    # TensorBoard logging
+    writer.add_scalar('Loss/train', epoch_loss/len(train_loader), epoch)
+    writer.add_scalar('PSNR/val', avg_psnr, epoch)
+    writer.add_scalar('LR', current_lr, epoch)
 
-        if best:
-            torch.save(state, os.path.join(self.config['output'], 'checkpoints', 'best.pth'))
-        torch.save(state, os.path.join(self.config['output'], 'checkpoints', 'latest.pth'))
+# Save final model
+torch.save({
+    'epoch': config['epochs'],
+    'state_dict': model.state_dict(),
+    'optimizer': optimizer.state_dict()
+}, os.path.join(weights_dir, f"model_final.pth"))
 
-
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--config', required=False, help='Path to config file')
-    args = parser.parse_args()
-
-    # Load config (in practice, use proper config loading)
-    config = {
-        'output': 'output',
-        'lr': 1e-4,
-        'weight_decay': 1e-4,
-        'loss_weights': [1.0, 0.5],
-        'epochs': 100
-    }
-
-    # Initialize trainer
-    trainer = Trainer(config)
-
-    # Dummy data loaders - replace with actual ones
-    train_loader = [{'input': torch.rand(4, 3, 256, 256),
-                     'target1': torch.rand(4, 3, 256, 256),
-                     'target2': torch.rand(4, 3, 256, 256)}] * 100
-    val_loader = [{'input': torch.rand(4, 3, 256, 256),
-                   'target': torch.rand(4, 3, 256, 256)}] * 20
-
-    # Start training
-    trainer.train(train_loader, val_loader, config['epochs'])
-
-
-if __name__ == '__main__':
-    main()
+print("\nTraining completed at:", datetime.datetime.now().isoformat())
+print(f'Best PSNR: {best_psnr:.4f} achieved at epoch {best_epoch}')
+print(f'Models saved in: {weights_dir}')
