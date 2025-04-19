@@ -60,13 +60,7 @@ def load_dataset():
         train_data = load_data_SID(train_input, train_gt, config['patch_size'], True)
         test_data = load_data_SID(test_input, test_gt, config['patch_size'], False)
     else:
-        train_c = np.load('Mono_Colored_RAW_Paired_DATASET/random_path_list/train/train_c_path.npy')[:32]
-        train_rgb = np.load('Mono_Colored_RAW_Paired_DATASET/random_path_list/train/train_rgb_path.npy')[:32]
-        test_c = np.load('Mono_Colored_RAW_Paired_DATASET/random_path_list/test/test_c_path.npy')[:32]
-        test_rgb = np.load('Mono_Colored_RAW_Paired_DATASET/random_path_list/test/test_rgb_path.npy')[:32]
-        
-        train_data = load_data_MCR(train_c, train_rgb, config['patch_size'], True)
-        test_data = load_data_MCR(test_c, test_rgb, config['patch_size'], False)
+        pass
     
     return train_data, test_data
 
