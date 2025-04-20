@@ -3,8 +3,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
 from torch.utils.data import DataLoader
-from skimage.metrics import peak_signal_noise_ratio as PSNR
-from skimage.metrics import structural_similarity as SSIM
 import numpy as np
 import os
 from tqdm import tqdm
