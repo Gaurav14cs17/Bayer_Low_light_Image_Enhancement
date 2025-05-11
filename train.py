@@ -1,6 +1,9 @@
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader
+import torch.distributed as dist
+from torch.utils.data import DataLoader, DistributedSampler
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data.distributed import DistributedSampler
 import torch.optim as optim
 from skimage.metrics import peak_signal_noise_ratio as PSNR
 from warmup_scheduler import GradualWarmupScheduler
@@ -16,16 +19,27 @@ from load_dataset import load_data_MCR, load_data_SID
 
 # Configuration
 config = {
-    'gpu_id': '0',
+    'gpu_ids': '0,1,2,3',  # Updated to support multiple GPUs
     'base_lr': 1e-4,
-    'batch_size': 16,
-    'dataset': 'SID',  # 'SID' or 'MCR'
+    'batch_size': 16,  # This will be per GPU
+    'dataset': 'SID',
     'patch_size': 512,
-    'model_size': 'S',  # 'S', 'B', or 'L'
+    'model_size': 'S',
     'epochs': 3000,
     'warmup_epochs': 20,
-    'min_lr': 1e-5
+    'min_lr': 1e-5,
+    'distributed': True,  # Enable distributed training
+    'local_rank': 0,      # Will be set automatically
 }
+
+# Initialize distributed training
+if 'WORLD_SIZE' in os.environ:
+    config['distributed'] = int(os.environ['WORLD_SIZE']) > 1
+
+if config['distributed']:
+    torch.cuda.set_device(config['local_rank'])
+    dist.init_process_group(backend='nccl', init_method='env://')
+    world_size = dist.get_world_size()
 
 # Setup directories
 result_dir = os.path.join('result', config['dataset'])
@@ -36,18 +50,26 @@ logs_dir = os.path.join(result_dir, 'logs')
 os.makedirs(logs_dir, exist_ok=True)
 
 # Device setup
-os.environ["CUDA_VISIBLE_DEVICES"] = config['gpu_id']
+os.environ["CUDA_VISIBLE_DEVICES"] = config['gpu_ids']
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-print(f'Using device: {device}')
 
 # Model initialization
 model_dim = {'S': 32, 'B': 48, 'L': 64}[config['model_size']]
 model = RawFormer(dim=model_dim).to(device)
 
+# Multi-GPU setup
+if config['distributed']:
+    model = DDP(model, device_ids=[config['local_rank']], output_device=config['local_rank'])
+else:
+    if torch.cuda.device_count() > 1:
+        print(f"Using {torch.cuda.device_count()} GPUs with DataParallel")
+        model = nn.DataParallel(model)
+
 # Print model info
-total_params = sum(p.numel() for p in model.parameters())
-trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-print(f'\nTrainable parameters: {trainable_params:,}\nTotal parameters: {total_params:,}\n')
+if config['local_rank'] == 0:
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f'\nTrainable parameters: {trainable_params:,}\nTotal parameters: {total_params:,}\n')
 
 # Dataset loading
 def load_dataset():
@@ -65,9 +87,34 @@ def load_dataset():
     return train_data, test_data
 
 train_data, test_data = load_dataset()
-train_loader = DataLoader(train_data, batch_size=config['batch_size'], shuffle=True, num_workers=16, pin_memory=True)
-test_loader = DataLoader(test_data, batch_size=config['batch_size'], shuffle=False, num_workers=16, pin_memory=True)
-print(f'Train batches: {len(train_loader)}, Test batches: {len(test_loader)}')
+
+# Distributed sampler if using DDP
+train_sampler = DistributedSampler(train_data) if config['distributed'] else None
+test_sampler = DistributedSampler(test_data, shuffle=False) if config['distributed'] else None
+
+# Adjust batch size for multi-GPU
+batch_size = config['batch_size'] // (world_size if config['distributed'] else torch.cuda.device_count())
+
+train_loader = DataLoader(
+    train_data, 
+    batch_size=batch_size,
+    shuffle=(train_sampler is None),
+    num_workers=16,
+    pin_memory=True,
+    sampler=train_sampler
+)
+
+test_loader = DataLoader(
+    test_data,
+    batch_size=batch_size,
+    shuffle=False,
+    num_workers=16,
+    pin_memory=True,
+    sampler=test_sampler
+)
+
+if config['local_rank'] == 0:
+    print(f'Train batches: {len(train_loader)}, Test batches: {len(test_loader)}')
 
 # Training setup
 criterion = nn.L1Loss()
@@ -82,21 +129,27 @@ scheduler = GradualWarmupScheduler(
 # Mixed precision training
 scaler = torch.cuda.amp.GradScaler()
 
-# TensorBoard writer
-writer = SummaryWriter(log_dir=logs_dir)
+# TensorBoard writer (only on master process)
+if config['local_rank'] == 0:
+    writer = SummaryWriter(log_dir=logs_dir)
 
 # Training loop
 best_psnr = 0
 best_epoch = 0
 
-print("Starting training at:", datetime.datetime.now().isoformat())
+if config['local_rank'] == 0:
+    print("Starting training at:", datetime.datetime.now().isoformat())
+
 for epoch in range(config['epochs']):
+    if config['distributed']:
+        train_sampler.set_epoch(epoch)
+    
     epoch_start = time.time()
     model.train()
     epoch_loss = 0
     
     # Training phase
-    for inputs, targets in tqdm.tqdm(train_loader, desc=f'Epoch {epoch}'):
+    for inputs, targets in tqdm.tqdm(train_loader, desc=f'Epoch {epoch}' if config['local_rank'] == 0 else None):
         inputs, targets = inputs.to(device), targets.to(device)
         
         optimizer.zero_grad()
@@ -107,59 +160,72 @@ for epoch in range(config['epochs']):
         scaler.scale(loss).backward()
         scaler.step(optimizer)
         scaler.update()
-        epoch_loss += loss.item()
+        
+        if config['distributed']:
+            # Aggregate losses across all GPUs
+            reduced_loss = loss.clone().detach()
+            dist.all_reduce(reduced_loss)
+            reduced_loss = reduced_loss / world_size
+            epoch_loss += reduced_loss.item()
+        else:
+            epoch_loss += loss.item()
     
     scheduler.step()
     
-    # Validation phase
-    model.eval()
-    psnr_values = []
-    with torch.no_grad():
-        for inputs, targets in tqdm.tqdm(test_loader, desc='Validating'):
-            inputs, targets = inputs.to(device), targets.to(device)
-            
-            with torch.cuda.amp.autocast():
-                outputs = model(inputs)
-                outputs = torch.clamp(outputs, 0, 1)
-            
-            # Convert to numpy and calculate PSNR
-            outputs_np = (outputs.cpu().numpy().transpose(0, 2, 3, 1) * 255).astype(np.uint8)
-            targets_np = (targets.cpu().numpy().transpose(0, 2, 3, 1) * 255).astype(np.uint8)
-            psnr_values.extend([PSNR(t, o) for t, o in zip(targets_np, outputs_np)])
-    
-    avg_psnr = np.mean(psnr_values)
-    
-    # Save best model
-    if avg_psnr > best_psnr:
-        best_psnr = avg_psnr
-        best_epoch = epoch
-        torch.save({
-            'epoch': epoch,
-            'state_dict': model.state_dict(),
-            'optimizer': optimizer.state_dict()
-        }, os.path.join(weights_dir, "model_best.pth"))
-    
-    # Logging
-    epoch_time = time.time() - epoch_start
-    current_lr = scheduler.get_lr()[0]
-    
-    print(f"\nEpoch {epoch}:")
-    print(f"Time: {epoch_time:.2f}s | Loss: {epoch_loss/len(train_loader):.4f}")
-    print(f"PSNR: {avg_psnr:.4f} | Best PSNR: {best_psnr:.4f} (epoch {best_epoch})")
-    print(f"Learning Rate: {current_lr:.6f}")
-    
-    # TensorBoard logging
-    writer.add_scalar('Loss/train', epoch_loss/len(train_loader), epoch)
-    writer.add_scalar('PSNR/val', avg_psnr, epoch)
-    writer.add_scalar('LR', current_lr, epoch)
+    # Validation phase (only on master process)
+    if config['local_rank'] == 0:
+        model.eval()
+        psnr_values = []
+        with torch.no_grad():
+            for inputs, targets in tqdm.tqdm(test_loader, desc='Validating'):
+                inputs, targets = inputs.to(device), targets.to(device)
+                
+                with torch.cuda.amp.autocast():
+                    outputs = model(inputs)
+                    outputs = torch.clamp(outputs, 0, 1)
+                
+                outputs_np = (outputs.cpu().numpy().transpose(0, 2, 3, 1) * 255).astype(np.uint8)
+                targets_np = (targets.cpu().numpy().transpose(0, 2, 3, 1) * 255).astype(np.uint8)
+                psnr_values.extend([PSNR(t, o) for t, o in zip(targets_np, outputs_np)])
+        
+        avg_psnr = np.mean(psnr_values)
+        
+        # Save best model
+        if avg_psnr > best_psnr:
+            best_psnr = avg_psnr
+            best_epoch = epoch
+            torch.save({
+                'epoch': epoch,
+                'state_dict': model.module.state_dict() if hasattr(model, 'module') else model.state_dict(),
+                'optimizer': optimizer.state_dict()
+            }, os.path.join(weights_dir, "model_best.pth"))
+        
+        # Logging
+        epoch_time = time.time() - epoch_start
+        current_lr = scheduler.get_lr()[0]
+        
+        print(f"\nEpoch {epoch}:")
+        print(f"Time: {epoch_time:.2f}s | Loss: {epoch_loss/len(train_loader):.4f}")
+        print(f"PSNR: {avg_psnr:.4f} | Best PSNR: {best_psnr:.4f} (epoch {best_epoch})")
+        print(f"Learning Rate: {current_lr:.6f}")
+        
+        # TensorBoard logging
+        writer.add_scalar('Loss/train', epoch_loss/len(train_loader), epoch)
+        writer.add_scalar('PSNR/val', avg_psnr, epoch)
+        writer.add_scalar('LR', current_lr, epoch)
 
-# Save final model
-torch.save({
-    'epoch': config['epochs'],
-    'state_dict': model.state_dict(),
-    'optimizer': optimizer.state_dict()
-}, os.path.join(weights_dir, f"model_final.pth"))
+# Save final model (only on master process)
+if config['local_rank'] == 0:
+    torch.save({
+        'epoch': config['epochs'],
+        'state_dict': model.module.state_dict() if hasattr(model, 'module') else model.state_dict(),
+        'optimizer': optimizer.state_dict()
+    }, os.path.join(weights_dir, f"model_final.pth"))
 
-print("\nTraining completed at:", datetime.datetime.now().isoformat())
-print(f'Best PSNR: {best_psnr:.4f} achieved at epoch {best_epoch}')
-print(f'Models saved in: {weights_dir}')
+    print("\nTraining completed at:", datetime.datetime.now().isoformat())
+    print(f'Best PSNR: {best_psnr:.4f} achieved at epoch {best_epoch}')
+    print(f'Models saved in: {weights_dir}')
+
+# Clean up distributed training
+if config['distributed']:
+    dist.destroy_process_group()
