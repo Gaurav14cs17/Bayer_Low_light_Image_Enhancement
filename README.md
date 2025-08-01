@@ -143,7 +143,7 @@ class CustomIDWT(nn.Module):
         return out.view(B, C, H * 2, W * 2)
 
 
-# 🔍 Sample Usage
+
 if __name__ == "__main__":
     custom_kernel = [
         [1,  1,  1,  1],
