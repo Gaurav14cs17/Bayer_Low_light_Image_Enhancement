@@ -5,68 +5,78 @@ from einops import rearrange
 
 
 class LuminanceAwareMHSA(nn.Module):
-    def __init__(self, dim, heads=8, dim_head=64, dropout=0.0):
+    def __init__(self, dim, heads=8, dim_head=None, bias=True, luma_bias=True):
         super().__init__()
         self.heads = heads
+        if dim_head is None:
+            assert dim % heads == 0, "dim must be divisible by heads or provide dim_head"
+            dim_head = dim // heads
+        self.dim_head = dim_head
+        inner = heads * dim_head
+        self.to_q = nn.Conv2d(dim, inner, 1, bias=bias)
+        self.to_k = nn.Conv2d(dim, inner, 1, bias=bias)
+        self.to_v = nn.Conv2d(dim, inner, 1, bias=bias)
+        self.proj = nn.Conv2d(inner, dim, 1, bias=bias)
         self.scale = dim_head ** -0.5
+        self.luma_cond = LumaCond(heads, dim_head)
+        self.luma_bias = luma_bias
+        if luma_bias:
+            self.alpha = nn.Parameter(torch.tensor(0.0))
 
-        inner_dim = dim_head * heads
-        self.to_q = nn.Linear(dim, inner_dim, bias=False)
-        self.to_k = nn.Linear(dim, inner_dim, bias=False)
-        self.to_v = nn.Linear(dim, inner_dim, bias=False)
+    def forward(self, x, luma=None, rgb_input=None):
+        B, C, H, W = x.shape
+        N = H * W  # Number of patches
 
-        self.to_out = nn.Sequential(
-            nn.Linear(inner_dim, dim),
-            nn.Dropout(dropout)
-        )
+        if luma is None:
+            assert rgb_input is not None and rgb_input.shape[1] == 3, \
+                "Provide luma or rgb_input for luminance."
+            luma = rgb_to_luma(rgb_input)
 
-        # Luminance bias strength
-        self.alpha = nn.Parameter(torch.tensor(0.0))
+        q = self.to_q(x)
+        k = self.to_k(x)
+        v = self.to_v(x)
 
-    def forward(self, x, luma):
-        """
-        x:    [B, H, W, C]
-        luma: [B, 1, H, W]
-        """
-        B, H, W, C = x.shape
-        N = H * W
+        gq, bq, gk, bk, gv, bv = self.luma_cond(luma)
 
-        # Flatten spatial
-        x_flat = x.view(B, H * W, C)
+        def reshape_film(t):
+            return t.view(B, self.heads, self.dim_head, 1, 1)
 
-        # Project Q, K, V
-        q = self.to_q(x_flat).view(B, N, self.heads, -1).transpose(1, 2)  # [B, heads, N, d]
-        k = self.to_k(x_flat).view(B, N, self.heads, -1).transpose(1, 2)
-        v = self.to_v(x_flat).view(B, N, self.heads, -1).transpose(1, 2)
+        def apply_film(t, g, b):
+            return g * t.view(B, self.heads, self.dim_head, H, W) + b
+
+        q = apply_film(q, *map(reshape_film, (gq, bq)))
+        k = apply_film(k, *map(reshape_film, (gk, bk)))
+        v = apply_film(v, *map(reshape_film, (gv, bv)))
+
+        # Reshape for attention
+        q = q.flatten(3).transpose(2, 3)  # B, heads, N, dim_head
+        k = k.flatten(3).transpose(2, 3)  # B, heads, N, dim_head
+        v = v.flatten(3).transpose(2, 3)  # B, heads, N, dim_head
 
         # Attention logits
-        attn_logits = torch.matmul(q, k.transpose(-2, -1)) * self.scale  # [B, heads, N, N]
+        attn_logits = torch.matmul(q, k.transpose(-2, -1)) * self.scale
 
-        # ----- Luminance-aware bias -----
-        # Inverse luminance (darker = higher bias)
-        invL = 1.0 - luma  # [B, 1, H, W]
-        invL = F.avg_pool2d(invL, kernel_size=3, stride=1, padding=1)  # smooth
-        invL = invL.view(B, -1)  # [B, N]
+        if self.luma_bias:
+            # Compute inverse luminance bias
+            invL = 1.0 - luma
+            invL = F.avg_pool2d(invL, kernel_size=3, stride=1, padding=1)
+            invL = invL.view(B, 1, N)  # B, 1, N
+            invL = invL - invL.mean(dim=-1, keepdim=True)  # Center
+            
+            # Create bias matrix (B, heads, N, N)
+            bias = torch.zeros(B, self.heads, N, N, device=x.device)
+            
+            # Add the bias to diagonal
+            diag_indices = torch.arange(N, device=x.device)
+            bias[:, :, diag_indices, diag_indices] = invL.unsqueeze(1)  # B, heads, N
+            
+            attn_logits = attn_logits + self.alpha * bias
 
-        # Outer sum → bias matrix [B, N, N]
-        bias_matrix = invL.unsqueeze(2) + invL.unsqueeze(1)  # [B, N, N]
-        bias_matrix = bias_matrix.unsqueeze(1).repeat(1, self.heads, 1, 1)  # [B, heads, N, N]
-
-        # Add bias
-        attn_logits = attn_logits + self.alpha * bias_matrix
-        # --------------------------------
-
-        # Softmax attention
-        attn = attn_logits.softmax(dim=-1)
-
-        # Weighted sum
-        out = torch.matmul(attn, v)  # [B, heads, N, d]
-        out = out.transpose(1, 2).reshape(B, N, -1)
-
-        return self.to_out(out).view(B, H, W, C)
-
-
-
+        attn = torch.softmax(attn_logits, dim=-1)
+        out = torch.matmul(attn, v)
+        out = out.transpose(2, 3).contiguous()
+        out = out.view(B, self.heads * self.dim_head, H, W)
+        return self.proj(out)
 
 # ----------------------------
 # Utility re-arrange helpers
