@@ -3,6 +3,71 @@ import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
 
+
+class LuminanceAwareMHSA(nn.Module):
+    def __init__(self, dim, heads=8, dim_head=64, dropout=0.0):
+        super().__init__()
+        self.heads = heads
+        self.scale = dim_head ** -0.5
+
+        inner_dim = dim_head * heads
+        self.to_q = nn.Linear(dim, inner_dim, bias=False)
+        self.to_k = nn.Linear(dim, inner_dim, bias=False)
+        self.to_v = nn.Linear(dim, inner_dim, bias=False)
+
+        self.to_out = nn.Sequential(
+            nn.Linear(inner_dim, dim),
+            nn.Dropout(dropout)
+        )
+
+        # Luminance bias strength
+        self.alpha = nn.Parameter(torch.tensor(0.0))
+
+    def forward(self, x, luma):
+        """
+        x:    [B, H, W, C]
+        luma: [B, 1, H, W]
+        """
+        B, H, W, C = x.shape
+        N = H * W
+
+        # Flatten spatial
+        x_flat = x.view(B, H * W, C)
+
+        # Project Q, K, V
+        q = self.to_q(x_flat).view(B, N, self.heads, -1).transpose(1, 2)  # [B, heads, N, d]
+        k = self.to_k(x_flat).view(B, N, self.heads, -1).transpose(1, 2)
+        v = self.to_v(x_flat).view(B, N, self.heads, -1).transpose(1, 2)
+
+        # Attention logits
+        attn_logits = torch.matmul(q, k.transpose(-2, -1)) * self.scale  # [B, heads, N, N]
+
+        # ----- Luminance-aware bias -----
+        # Inverse luminance (darker = higher bias)
+        invL = 1.0 - luma  # [B, 1, H, W]
+        invL = F.avg_pool2d(invL, kernel_size=3, stride=1, padding=1)  # smooth
+        invL = invL.view(B, -1)  # [B, N]
+
+        # Outer sum → bias matrix [B, N, N]
+        bias_matrix = invL.unsqueeze(2) + invL.unsqueeze(1)  # [B, N, N]
+        bias_matrix = bias_matrix.unsqueeze(1).repeat(1, self.heads, 1, 1)  # [B, heads, N, N]
+
+        # Add bias
+        attn_logits = attn_logits + self.alpha * bias_matrix
+        # --------------------------------
+
+        # Softmax attention
+        attn = attn_logits.softmax(dim=-1)
+
+        # Weighted sum
+        out = torch.matmul(attn, v)  # [B, heads, N, d]
+        out = out.transpose(1, 2).reshape(B, N, -1)
+
+        return self.to_out(out).view(B, H, W, C)
+
+
+
+
 # ----------------------------
 # Utility re-arrange helpers
 # ----------------------------
