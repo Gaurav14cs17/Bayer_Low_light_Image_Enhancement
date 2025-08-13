@@ -51,7 +51,7 @@ class LayerNorm(nn.Module):
         h, w = x.shape[-2:]
         return to_4d(self.body(to_3d(x)), h, w)
 
-class conv_ffn(nn.Module):
+class ConvFFN(nn.Module):  # Changed from conv_ffn to ConvFFN (PEP8 class naming)
     """
     Feed-forward Network with Depth-wise Convolution
     """
@@ -285,7 +285,7 @@ class TransformerBlock(nn.Module):
         self.norm1 = LayerNorm(dim)
         self.attn = LuminanceAwareMHSA(dim=dim, heads=num_heads, dim_head=dim_head, bias=bias, luma_bias=True)
         self.norm2 = LayerNorm(dim)
-        self.ffn = conv_ffn(dim, dim * ffn_expansion_factor, dim)
+        self.ffn = ConvFFN(dim, dim * ffn_expansion_factor, dim)  # Changed from conv_ffn to ConvFFN
 
     def forward(self, x, rgb_for_luma=None, luma=None):
         x = x + self.attn(self.norm1(x), luma=luma, rgb_input=rgb_for_luma)
@@ -295,22 +295,22 @@ class TransformerBlock(nn.Module):
 # ----------------------------
 # Conv + Transformer wrapper
 # ----------------------------
-class Conv_Transformer(nn.Module):
+class ConvTransformer(nn.Module):  # Changed from Conv_Transformer to ConvTransformer (PEP8)
     def __init__(self, in_channel, num_heads=8, ffn_expansion_factor=2, dim_head=None):
         super().__init__()
         self.lrelu = nn.LeakyReLU(0.2, inplace=False)
         self.conv = nn.Conv2d(in_channels=in_channel, out_channels=in_channel, kernel_size=3, stride=1, padding=1)
-        self.Transformer = TransformerBlock(dim=in_channel, num_heads=num_heads,
+        self.transformer = TransformerBlock(dim=in_channel, num_heads=num_heads,
                                          ffn_expansion_factor=ffn_expansion_factor, bias=True, dim_head=dim_head)
         self.channel_reduce = nn.Conv2d(in_channels=in_channel * 2, out_channels=in_channel, kernel_size=1, stride=1)
-        self.Conv_out = nn.Conv2d(in_channels=in_channel, out_channels=in_channel, kernel_size=3, stride=1, padding=1)
+        self.conv_out = nn.Conv2d(in_channels=in_channel, out_channels=in_channel, kernel_size=3, stride=1, padding=1)
 
     def forward(self, x, rgb_for_luma=None, luma=None):
         conv = self.lrelu(self.conv(x))
-        trans = self.Transformer(x, rgb_for_luma=rgb_for_luma, luma=luma)
+        trans = self.transformer(x, rgb_for_luma=rgb_for_luma, luma=luma)
         x = torch.cat([conv, trans], 1)
         x = self.channel_reduce(x)
-        x = self.lrelu(self.Conv_out(x))
+        x = self.lrelu(self.conv_out(x))
         return x
 
 # ----------------------------
@@ -328,29 +328,29 @@ class RawFormer(nn.Module):
         self.embedding = nn.Conv2d(inp_channels * 4, dim, kernel_size=3, stride=1, padding=1)
 
         # Encoder
-        self.conv_tran1 = Conv_Transformer(dim, num_heads=num_heads[0], ffn_expansion_factor=ffn_expansion_factor)
+        self.conv_tran1 = ConvTransformer(dim, num_heads=num_heads[0], ffn_expansion_factor=ffn_expansion_factor)
         self.down1 = Downsample(dim)
 
-        self.conv_tran2 = Conv_Transformer(dim * 2, num_heads=num_heads[1], ffn_expansion_factor=ffn_expansion_factor)
+        self.conv_tran2 = ConvTransformer(dim * 2, num_heads=num_heads[1], ffn_expansion_factor=ffn_expansion_factor)
         self.down2 = Downsample(dim * 2)
 
-        self.conv_tran3 = Conv_Transformer(dim * 4, num_heads=num_heads[2], ffn_expansion_factor=ffn_expansion_factor)
+        self.conv_tran3 = ConvTransformer(dim * 4, num_heads=num_heads[2], ffn_expansion_factor=ffn_expansion_factor)
         self.down3 = Downsample(dim * 4)
 
-        self.conv_tran4 = Conv_Transformer(dim * 8, num_heads=num_heads[3], ffn_expansion_factor=ffn_expansion_factor)
+        self.conv_tran4 = ConvTransformer(dim * 8, num_heads=num_heads[3], ffn_expansion_factor=ffn_expansion_factor)
 
         # Decoder
         self.up1 = nn.ConvTranspose2d(dim * 8, dim * 4, 2, stride=2)
         self.channel_reduce1 = nn.Conv2d(dim * 8, dim * 4, 1, 1)
-        self.conv_tran5 = Conv_Transformer(dim * 4, num_heads=num_heads[2], ffn_expansion_factor=ffn_expansion_factor)
+        self.conv_tran5 = ConvTransformer(dim * 4, num_heads=num_heads[2], ffn_expansion_factor=ffn_expansion_factor)
 
         self.up2 = nn.ConvTranspose2d(dim * 4, dim * 2, 2, stride=2)
         self.channel_reduce2 = nn.Conv2d(dim * 4, dim * 2, 1, 1)
-        self.conv_tran6 = Conv_Transformer(dim * 2, num_heads=num_heads[1], ffn_expansion_factor=ffn_expansion_factor)
+        self.conv_tran6 = ConvTransformer(dim * 2, num_heads=num_heads[1], ffn_expansion_factor=ffn_expansion_factor)
 
         self.up3 = nn.ConvTranspose2d(dim * 2, dim * 1, 2, stride=2)
         self.channel_reduce3 = nn.Conv2d(dim * 2, dim * 1, 1, 1)
-        self.conv_tran7 = Conv_Transformer(dim, num_heads=num_heads[0], ffn_expansion_factor=ffn_expansion_factor)
+        self.conv_tran7 = ConvTransformer(dim, num_heads=num_heads[0], ffn_expansion_factor=ffn_expansion_factor)
 
         self.conv_out = nn.Conv2d(dim, out_channels * 4, kernel_size=3, stride=1, padding=1)
         self.pixelshuffle = nn.PixelShuffle(2)
