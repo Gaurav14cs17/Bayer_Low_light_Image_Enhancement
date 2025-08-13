@@ -1,4 +1,3 @@
-# rawformer_luma.py
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -51,7 +50,7 @@ class LayerNorm(nn.Module):
         h, w = x.shape[-2:]
         return to_4d(self.body(to_3d(x)), h, w)
 
-class ConvFFN(nn.Module):  # Changed from conv_ffn to ConvFFN (PEP8 class naming)
+class ConvFFN(nn.Module):
     """
     Feed-forward Network with Depth-wise Convolution
     """
@@ -175,6 +174,39 @@ class BayerLuma(nn.Module):
         luma_max = luma.amax(dim=(2, 3), keepdim=True)
         luma_norm = (luma - luma_min) / (luma_max - luma_min + 1e-6)
         return luma_norm
+
+# ----------------------------
+# Luminance-Aware MHSA
+# ----------------------------
+class LumaCond(nn.Module):
+    def __init__(self, heads, dim_head, per_head=True):
+        super().__init__()
+        self.per_head = per_head
+        out_ch = heads * dim_head if per_head else dim_head
+        hidden = max(16, out_ch // 2)
+        self.net = nn.Sequential(
+            nn.Conv2d(1, hidden, 3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(hidden, hidden, 3, padding=1),
+            nn.ReLU(inplace=True)
+        )
+        self.gamma_q = nn.Conv2d(hidden, out_ch, 1)
+        self.beta_q = nn.Conv2d(hidden, out_ch, 1)
+        self.gamma_k = nn.Conv2d(hidden, out_ch, 1)
+        self.beta_k = nn.Conv2d(hidden, out_ch, 1)
+        self.gamma_v = nn.Conv2d(hidden, out_ch, 1)
+        self.beta_v = nn.Conv2d(hidden, out_ch, 1)
+
+    def forward(self, L):
+        h = self.net(L)
+        gq, bq = self.gamma_q(h), self.beta_q(h)
+        gk, bk = self.gamma_k(h), self.beta_k(h)
+        gv, bv = self.gamma_v(h), self.beta_v(h)
+        gq, bq = gq.mean(dim=(2, 3), keepdim=True), bq.mean(dim=(2, 3), keepdim=True)
+        gk, bk = gk.mean(dim=(2, 3), keepdim=True), bk.mean(dim=(2, 3), keepdim=True)
+        gv, bv = gv.mean(dim=(2, 3), keepdim=True), bv.mean(dim=(2, 3), keepdim=True)
+        return (gq, bq, gk, bk, gv, bv)
+
 class LuminanceAwareMHSA(nn.Module):
     def __init__(self, dim, heads=8, dim_head=None, bias=True, luma_bias=True):
         super().__init__()
@@ -241,103 +273,6 @@ class LuminanceAwareMHSA(nn.Module):
         out = out.transpose(2, 3).contiguous()
         out = out.view(B, self.heads * self.dim_head, H, W)
         return self.proj(out)
-        
-# ----------------------------
-# Luminance-Aware MHSA
-# ----------------------------
-class LumaCond(nn.Module):
-    def __init__(self, heads, dim_head, per_head=True):
-        super().__init__()
-        self.per_head = per_head
-        out_ch = heads * dim_head if per_head else dim_head
-        hidden = max(16, out_ch // 2)
-        self.net = nn.Sequential(
-            nn.Conv2d(1, hidden, 3, padding=1),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(hidden, hidden, 3, padding=1),
-            nn.ReLU(inplace=True)
-        )
-        self.gamma_q = nn.Conv2d(hidden, out_ch, 1)
-        self.beta_q = nn.Conv2d(hidden, out_ch, 1)
-        self.gamma_k = nn.Conv2d(hidden, out_ch, 1)
-        self.beta_k = nn.Conv2d(hidden, out_ch, 1)
-        self.gamma_v = nn.Conv2d(hidden, out_ch, 1)
-        self.beta_v = nn.Conv2d(hidden, out_ch, 1)
-
-    def forward(self, L):
-        h = self.net(L)
-        gq, bq = self.gamma_q(h), self.beta_q(h)
-        gk, bk = self.gamma_k(h), self.beta_k(h)
-        gv, bv = self.gamma_v(h), self.beta_v(h)
-        gq, bq = gq.mean(dim=(2, 3), keepdim=True), bq.mean(dim=(2, 3), keepdim=True)
-        gk, bk = gk.mean(dim=(2, 3), keepdim=True), bk.mean(dim=(2, 3), keepdim=True)
-        gv, bv = gv.mean(dim=(2, 3), keepdim=True), bv.mean(dim=(2, 3), keepdim=True)
-        return (gq, bq, gk, bk, gv, bv)
-
-class LuminanceAwareMHSA(nn.Module):
-    def __init__(self, dim, heads=8, dim_head=None, bias=True, luma_bias=True):
-        super().__init__()
-        self.heads = heads
-        if dim_head is None:
-            assert dim % heads == 0, "dim must be divisible by heads or provide dim_head"
-            dim_head = dim // heads
-        self.dim_head = dim_head
-        inner = heads * dim_head
-        self.to_q = nn.Conv2d(dim, inner, 1, bias=bias)
-        self.to_k = nn.Conv2d(dim, inner, 1, bias=bias)
-        self.to_v = nn.Conv2d(dim, inner, 1, bias=bias)
-        self.proj = nn.Conv2d(inner, dim, 1, bias=bias)
-        self.scale = dim_head ** -0.5
-        self.luma_cond = LumaCond(heads, dim_head)
-        self.luma_bias = luma_bias
-        if luma_bias:
-            self.alpha = nn.Parameter(torch.tensor(0.0))
-
-    def forward(self, x, luma=None, rgb_input=None):
-        B, C, H, W = x.shape
-
-        if luma is None:
-            # If luma isn't provided but rgb_input is, compute it from RGB.
-            # If neither is provided, raise an assert to force providing luma.
-            assert rgb_input is not None and rgb_input.shape[1] == 3, \
-                "Provide luma or rgb_input for luminance."
-            luma = rgb_to_luma(rgb_input)
-
-        q = self.to_q(x)
-        k = self.to_k(x)
-        v = self.to_v(x)
-
-        gq, bq, gk, bk, gv, bv = self.luma_cond(luma)
-
-        def reshape_film(t):
-            return t.view(B, self.heads, self.dim_head, 1, 1)
-
-        def apply_film(t, g, b):
-            return g * t.view(B, self.heads, self.dim_head, H, W) + b
-
-        q = apply_film(q, *map(reshape_film, (gq, bq)))
-        k = apply_film(k, *map(reshape_film, (gk, bk)))
-        v = apply_film(v, *map(reshape_film, (gv, bv)))
-
-        q = q.flatten(3).transpose(2, 3)  # B, heads, N, dim_head -> B, heads, N, dim_head but transposed
-        k = k.flatten(3).transpose(2, 3)
-        v = v.flatten(3).transpose(2, 3)
-
-        attn_logits = torch.matmul(q, k.transpose(-2, -1)) * self.scale
-
-        if self.luma_bias:
-            invL = 1.0 - luma
-            invL = F.avg_pool2d(invL, kernel_size=3, stride=1, padding=1)
-            invL = invL.view(B, 1, -1)
-            invL = invL - invL.mean(dim=-1, keepdim=True)
-            bias = invL.unsqueeze(1).repeat(1, self.heads, invL.shape[-1], 1)
-            attn_logits = attn_logits + self.alpha * bias
-
-        attn = torch.softmax(attn_logits, dim=-1)
-        out = torch.matmul(attn, v)
-        out = out.transpose(2, 3).contiguous()
-        out = out.view(B, self.heads * self.dim_head, H, W)
-        return self.proj(out)
 
 # ----------------------------
 # Transformer block using LuminanceAwareMHSA
@@ -351,7 +286,7 @@ class TransformerBlock(nn.Module):
         self.norm1 = LayerNorm(dim)
         self.attn = LuminanceAwareMHSA(dim=dim, heads=num_heads, dim_head=dim_head, bias=bias, luma_bias=True)
         self.norm2 = LayerNorm(dim)
-        self.ffn = ConvFFN(dim, dim * ffn_expansion_factor, dim)  # Changed from conv_ffn to ConvFFN
+        self.ffn = ConvFFN(dim, dim * ffn_expansion_factor, dim)
 
     def forward(self, x, rgb_for_luma=None, luma=None):
         x = x + self.attn(self.norm1(x), luma=luma, rgb_input=rgb_for_luma)
@@ -361,7 +296,7 @@ class TransformerBlock(nn.Module):
 # ----------------------------
 # Conv + Transformer wrapper
 # ----------------------------
-class ConvTransformer(nn.Module):  # Changed from Conv_Transformer to ConvTransformer (PEP8)
+class ConvTransformer(nn.Module):
     def __init__(self, in_channel, num_heads=8, ffn_expansion_factor=2, dim_head=None):
         super().__init__()
         self.lrelu = nn.LeakyReLU(0.2, inplace=False)
@@ -477,7 +412,7 @@ if __name__ == "__main__":
                      bayer_pattern='rggb').to(device)
 
     # Test with synthetic Bayer RAW input (RGGB)
-    B, H, W = 1, 256, 256
+    B, H, W = 1, 128, 128
     bayer = torch.zeros(B, 1, H, W, device=device)
     # synthetic values at Bayer positions
     bayer[:, :, 0::2, 0::2] = 0.8    # R
