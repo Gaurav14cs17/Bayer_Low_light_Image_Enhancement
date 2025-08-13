@@ -175,7 +175,73 @@ class BayerLuma(nn.Module):
         luma_max = luma.amax(dim=(2, 3), keepdim=True)
         luma_norm = (luma - luma_min) / (luma_max - luma_min + 1e-6)
         return luma_norm
+class LuminanceAwareMHSA(nn.Module):
+    def __init__(self, dim, heads=8, dim_head=None, bias=True, luma_bias=True):
+        super().__init__()
+        self.heads = heads
+        if dim_head is None:
+            assert dim % heads == 0, "dim must be divisible by heads or provide dim_head"
+            dim_head = dim // heads
+        self.dim_head = dim_head
+        inner = heads * dim_head
+        self.to_q = nn.Conv2d(dim, inner, 1, bias=bias)
+        self.to_k = nn.Conv2d(dim, inner, 1, bias=bias)
+        self.to_v = nn.Conv2d(dim, inner, 1, bias=bias)
+        self.proj = nn.Conv2d(inner, dim, 1, bias=bias)
+        self.scale = dim_head ** -0.5
+        self.luma_cond = LumaCond(heads, dim_head)
+        self.luma_bias = luma_bias
+        if luma_bias:
+            self.alpha = nn.Parameter(torch.tensor(0.0))
 
+    def forward(self, x, luma=None, rgb_input=None):
+        B, C, H, W = x.shape
+
+        if luma is None:
+            assert rgb_input is not None and rgb_input.shape[1] == 3, \
+                "Provide luma or rgb_input for luminance."
+            luma = rgb_to_luma(rgb_input)
+
+        q = self.to_q(x)
+        k = self.to_k(x)
+        v = self.to_v(x)
+
+        gq, bq, gk, bk, gv, bv = self.luma_cond(luma)
+
+        def reshape_film(t):
+            return t.view(B, self.heads, self.dim_head, 1, 1)
+
+        def apply_film(t, g, b):
+            return g * t.view(B, self.heads, self.dim_head, H, W) + b
+
+        q = apply_film(q, *map(reshape_film, (gq, bq)))
+        k = apply_film(k, *map(reshape_film, (gk, bk)))
+        v = apply_film(v, *map(reshape_film, (gv, bv)))
+
+        q = q.flatten(3).transpose(2, 3)  # B, heads, N, dim_head
+        k = k.flatten(3).transpose(2, 3)  # B, heads, N, dim_head
+        v = v.flatten(3).transpose(2, 3)  # B, heads, N, dim_head
+
+        attn_logits = torch.matmul(q, k.transpose(-2, -1)) * self.scale
+
+        if self.luma_bias:
+            invL = 1.0 - luma
+            invL = F.avg_pool2d(invL, kernel_size=3, stride=1, padding=1)
+            invL = invL.view(B, 1, -1)  # B, 1, N
+            invL = invL - invL.mean(dim=-1, keepdim=True)
+            
+            # Reshape bias to match attention logits shape
+            bias = invL.unsqueeze(1)  # B, 1, 1, N
+            bias = bias.repeat(1, self.heads, 1, 1)  # B, heads, 1, N
+            
+            attn_logits = attn_logits + self.alpha * bias
+
+        attn = torch.softmax(attn_logits, dim=-1)
+        out = torch.matmul(attn, v)
+        out = out.transpose(2, 3).contiguous()
+        out = out.view(B, self.heads * self.dim_head, H, W)
+        return self.proj(out)
+        
 # ----------------------------
 # Luminance-Aware MHSA
 # ----------------------------
