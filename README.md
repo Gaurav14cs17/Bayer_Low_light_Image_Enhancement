@@ -2,6 +2,7 @@
 
 - ##### WaveTransformBlock
 ![WaveTransformBlock](./images/image_1.png )
+![WaveTransformBlock](./images/daigram_2.png )
 
 
 # RawFormer: Efficient Raw Image Processing with Transformer-CNN Hybrid Architecture
