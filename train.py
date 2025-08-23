@@ -75,10 +75,14 @@ if __name__ == '__main__':
     # ------------------------------
     if opt['dataset'] == 'SID':
         train_input_paths = glob.glob(opt['train_sid_short']) + glob.glob("Sony/short/2*_00_0.1s.ARW")
-        train_gt_paths = [os.path.join(opt['train_sid_long'], os.path.basename(x).replace('short', 'long')) for x in train_input_paths]
+        train_gt_paths = []
+        for x in train_input_paths:
+            train_gt_paths += glob.glob(os.path.join(opt['train_sid_long'], '*' + x[-17:-12] + '*.ARW'))
 
         test_input_paths = glob.glob(opt['test_sid_short'])
-        test_gt_paths = [os.path.join(opt['test_sid_long'], os.path.basename(x).replace('short', 'long')) for x in test_input_paths]
+        test_gt_paths = []
+        for x in test_input_paths:
+            test_gt_paths += glob.glob(os.path.join(opt['test_sid_long'], '*' + x[-17:-12] + '*.ARW'))
 
         train_data = load_data_SID(train_input_paths, train_gt_paths, patch_size=opt['patch_size'], training=True)
         test_data = load_data_SID(test_input_paths, test_gt_paths, patch_size=opt['patch_size'], training=False)
