@@ -16,7 +16,7 @@ from load_dataset import load_data_MCR, load_data_SID
 # ------------------------------
 def correct_bayer_channels(rgb, pattern="RGGB"):
     """
-    Ensures correct RGB channel order based on Bayer pattern.
+    Ensure correct RGB channel order based on Bayer pattern.
     """
     pattern = pattern.upper()
     if pattern == "BGGR":
@@ -53,76 +53,69 @@ if __name__ == '__main__':
     save_weights_file = os.path.join('result', opt['dataset'], 'weights')
     save_images_file = os.path.join('result', opt['dataset'], 'images')
     save_csv_file = os.path.join('result', opt['dataset'], 'csv')
-    tb_log_dir = os.path.join('result', opt['dataset'], 'logs')
 
+    # ------------------------------
     # Load test dataset
+    # ------------------------------
     if opt['dataset'] == 'SID':
-        test_input_paths = glob.glob(os.path.join('Sony/short/1*_00_0.1s.ARW'))
-        test_gt_paths = []
-        for x in test_input_paths:
-            test_gt_paths += glob.glob(os.path.join('Sony/long/*' + x[-17:-12] + '*.ARW'))
-        print('test data: %d pairs' % len(test_input_paths))
+        test_input_paths = glob.glob(os.path.join('Sony/short/', '*.ARW'))
+        test_gt_paths = [x.replace('short', 'long') for x in test_input_paths]
+        print(f'Test data: {len(test_input_paths)} pairs')
         test_data = load_data_SID(test_input_paths, test_gt_paths, training=False)
 
     elif opt['dataset'] == 'MCR':
-        test_c_path = np.load('Mono_Colored_RAW_Paired_DATASET/random_path_list/test/test_c_path.npy')
-        test_rgb_path = np.load('Mono_Colored_RAW_Paired_DATASET/random_path_list/test/test_rgb_path.npy')
-        print('test data: %d pairs' % len(test_c_path))
-        test_data = load_data_MCR(test_c_path, test_rgb_path, training=False)
+        test_c_path = np.load('Mono_Colored_RAW_Paired_DATASET/random_path_list/test/test_c_path.npy', allow_pickle=True)
+        test_rgb_path = np.load('Mono_Colored_RAW_Paired_DATASET/random_path_list/test/test_rgb_path.npy', allow_pickle=True)
+        print(f'Test data: {len(test_c_path)} pairs')
+        test_data = load_data_MCR(test_c_path.tolist(), test_rgb_path.tolist(), training=False)
 
     dataloader_test = DataLoader(test_data, batch_size=1, shuffle=False, pin_memory=True)
 
+    # ------------------------------
     # Device setup
-    if opt['use_gpu']:
+    # ------------------------------
+    device = torch.device("cuda" if opt['use_gpu'] and torch.cuda.is_available() else "cpu")
+    if device.type == 'cuda':
         os.environ["CUDA_VISIBLE_DEVICES"] = opt['gpu_id']
-        device = torch.device("cuda")
         torch.cuda.empty_cache()
-    else:
-        device = torch.device("cpu")
-
-    # Model dimension
-    if opt['model_size'] == 'S':
-        dim = 32
-    elif opt['model_size'] == 'B':
-        dim = 48
-    else:
-        dim = 64
-
-    # Load model
-    model = RawFormer(dim=dim)
-    checkpoint = torch.load(
-        os.path.join(save_weights_file, f'RawFormer_{opt["model_size"]}_{opt["dataset"]}.pth'),
-        map_location=device
-    )
-
-    model.load_state_dict(
-        {k.replace('module.', ''): v for k, v in checkpoint['state_dict'].items()},
-        strict=True
-    )
-    epoch = checkpoint['epoch']
-    print('Loaded model from epoch:', epoch)
-
-    model = model.to(device)
-    model.eval()
-    print('Device on cuda:', next(model.parameters()).is_cuda)
 
     # ------------------------------
-    # Test loop
+    # Model setup
+    # ------------------------------
+    dim = {'S': 32, 'B': 48, 'L': 64}[opt['model_size']]
+    model = RawFormer(dim=dim).to(device)
+
+    checkpoint_path = os.path.join(save_weights_file, f'RawFormer_{opt["model_size"]}_{opt["dataset"]}.pth')
+    checkpoint = torch.load(checkpoint_path, map_location=device)
+    state_dict = {k.replace('module.', ''): v for k, v in checkpoint['state_dict'].items()}
+    model.load_state_dict(state_dict, strict=True)
+    epoch = checkpoint.get('epoch', 0)
+    print('Loaded model from epoch:', epoch)
+
+    model.eval()
+
+    # ------------------------------
+    # Testing loop
     # ------------------------------
     psnr_val_rgb = []
     ssim_val_rgb = []
 
+    os.makedirs(save_images_file, exist_ok=True)
+    os.makedirs(save_csv_file, exist_ok=True)
+
     with torch.no_grad():
-        for ii, data_test in enumerate(tqdm.tqdm(dataloader_test)):
+        for ii, (inp_tensor, gt_tensor) in enumerate(tqdm.tqdm(dataloader_test)):
+            inp_tensor = inp_tensor.to(device)
+
             # Ground truth
-            rgb_gt = (data_test[1].numpy().squeeze().transpose((1, 2, 0)) * 255).astype(np.uint8)
+            rgb_gt = (gt_tensor[0].cpu().numpy().transpose(1, 2, 0) * 255).astype(np.uint8)
             rgb_gt = correct_bayer_channels(rgb_gt, opt['bayer_pattern'])
             rgb_gt = auto_correct_rb(rgb_gt)
 
             # Model prediction
-            input_raw = data_test[0].to(device)
-            pred_rgb = model(input_raw)
-            pred_rgb = (torch.clamp(pred_rgb, 0, 1).cpu().numpy().squeeze().transpose((1, 2, 0)) * 255).astype(np.uint8)
+            pred_rgb = model(inp_tensor)
+            pred_rgb = torch.clamp(pred_rgb, 0, 1)
+            pred_rgb = (pred_rgb[0].cpu().numpy().transpose(1, 2, 0) * 255).astype(np.uint8)
             pred_rgb = correct_bayer_channels(pred_rgb, opt['bayer_pattern'])
             pred_rgb = auto_correct_rb(pred_rgb)
 
@@ -134,16 +127,17 @@ if __name__ == '__main__':
             ssim_val_rgb.append(ssim)
 
             # Save images
-            os.makedirs(save_images_file, exist_ok=True)
             imageio.imwrite(os.path.join(save_images_file, f'e{epoch}_{ii}_gt.jpg'), rgb_gt)
             imageio.imwrite(os.path.join(save_images_file, f'e{epoch}_{ii}_psnr_{psnr:.4f}_ssim_{ssim:.4f}.jpg'), pred_rgb)
 
+    # ------------------------------
     # Average metrics
-    psnr_average = sum(psnr_val_rgb) / len(dataloader_test)
-    ssim_average = sum(ssim_val_rgb) / len(dataloader_test)
-    print("average_PSNR: %.4f, average_SSIM: %.4f" % (psnr_average, ssim_average))
+    # ------------------------------
+    psnr_average = np.mean(psnr_val_rgb)
+    ssim_average = np.mean(ssim_val_rgb)
+    print(f"Average PSNR: {psnr_average:.4f}, Average SSIM: {ssim_average:.4f}")
 
     # Save CSV
-    os.makedirs(save_csv_file, exist_ok=True)
     np.savetxt(os.path.join(save_csv_file, 'test_metrics.csv'),
-               [p for p in zip(psnr_val_rgb, ssim_val_rgb)], delimiter=',', fmt='%s')
+               np.column_stack((psnr_val_rgb, ssim_val_rgb)),
+               delimiter=',', fmt='%.4f')
