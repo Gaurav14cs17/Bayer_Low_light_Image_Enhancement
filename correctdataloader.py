@@ -58,6 +58,8 @@ class load_data_SID(Dataset):
         self.training = training
         self.patch_size = patch_size
         self.bayer_pattern = bayer_pattern
+        self.short_expo_files = short_expo_files
+        self.long_expo_files = long_expo_files
 
         if self.training:
             print('\n...... Train files loading\n')
@@ -72,10 +74,10 @@ class load_data_SID(Dataset):
 
     def __getitem__(self, idx):
         img_short = self.short_list[idx].astype(np.float32)
-        img_long = self.long_list[idx].astype(np.float32) / 65535.0  # normalize GT
+        img_long = self.long_list[idx].astype(np.float32) / 65535.0
 
-        # Exposure scaling for raw
-        ap = 300 if self.long_list[idx][-7] == '3' else 100
+        # Exposure scaling using filename
+        ap = 300 if self.long_expo_files[idx][-7] == '3' else 100
         img_short = np.maximum(img_short - 512, 0) / (16383 - 512) * ap
 
         H, W = img_short.shape
@@ -122,6 +124,8 @@ class load_data_MCR(Dataset):
         self.training = training
         self.patch_size = patch_size
         self.bayer_pattern = bayer_pattern
+        self.train_c_path = train_c_path
+        self.train_rgb_path = train_rgb_path
 
         if self.training:
             print('\n...... Train files loading\n')
@@ -138,9 +142,9 @@ class load_data_MCR(Dataset):
         inp_raw = self.inp_list[idx]
         gt_rgb = self.gt_list[idx]
 
-        # Exposure scaling
-        img_num = int(str(idx)[-3:])  # replace your original logic here
-        img_expo = 1000  # default if not available
+        # Exposure scaling using filename info (example: you can adjust based on your filenames)
+        img_num = int(self.train_c_path[idx][-23:-20])
+        img_expo = int(self.train_c_path[idx][-8:-4],16)
         gt_expo = 12287 if img_num < 500 else 1023
         amp = gt_expo / img_expo
         inp_raw = inp_raw / 255 * amp
