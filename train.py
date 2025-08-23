@@ -1,200 +1,182 @@
-import os
 import torch
 import torch.nn as nn
-import torch.distributed as dist
-from torch.utils.data import DataLoader, DistributedSampler
-from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.utils.data.distributed import DistributedSampler
-from torch.utils.tensorboard import SummaryWriter
-from PIL import Image, ImageDraw, ImageFont, ImageFilter
+from torch.utils.data import DataLoader
+import torch.optim as optim
+from skimage.metrics import peak_signal_noise_ratio as PSNR
+from warmup_scheduler import GradualWarmupScheduler
 import numpy as np
-import random
+import os
+import tqdm
 import glob
 import time
 import datetime
-from tqdm import tqdm
-from warmup_scheduler import GradualWarmupScheduler
+from model import RawFormer
+from load_dataset import load_data_MCR, load_data_SID
 
-# Configuration
-config = {
-    'gpu_ids': '0,1,2,3',          # Comma-separated GPU IDs
-    'base_lr': 2e-4,                # Scaled up for multi-GPU
-    'batch_size': 16,               # Per GPU batch size
-    'image_size': (80, 400),        # Output image dimensions
-    'font_size': 34,                # Base font size
-    'epochs': 1000,
-    'warmup_epochs': 20,
-    'min_lr': 1e-5,
-    'num_workers': 8,
-    'distributed': True,            # Enable DDP
-    'local_rank': 0                 # Will be set by torch.distributed.launch
-}
+class CharbonnierLoss(nn.Module):
+    """Charbonnier Loss (L1)"""
+    def __init__(self, eps=1e-3):
+        super(CharbonnierLoss, self).__init__()
+        self.eps = eps
 
-# Initialize distributed training
-if 'WORLD_SIZE' in os.environ:
-    config['distributed'] = int(os.environ['WORLD_SIZE']) > 1
+    def forward(self, x, y):
+        diff = x - y
+        loss = torch.mean(torch.sqrt(diff * diff + self.eps * self.eps))
+        return loss
 
-if config['distributed']:
-    torch.cuda.set_device(config['local_rank'])
-    dist.init_process_group(backend='nccl', init_method='env://')
-    world_size = dist.get_world_size()
+if __name__ == '__main__':
+    # ------------------------------
+    # Options
+    # ------------------------------
+    opt = {
+        'base_lr': 1e-4,
+        'batch_size': 16,
+        'dataset': 'SID',           # 'SID' or 'MCR'
+        'patch_size': 512,
+        'model_size': 'S',          # S/B/L
+        'epochs': 3000,
+        'train_sid_short': "Sony/short/0*_00_0.1s.ARW",
+        'train_sid_long': "Sony/long/",
+        'test_sid_short': "Sony/short/1*_00_0.1s.ARW",
+        'test_sid_long': "Sony/long/",
+        'train_mcr_c': "Mono_Colored_RAW_Paired_DATASET/random_path_list/train/train_c_path.npy",
+        'train_mcr_rgb': "Mono_Colored_RAW_Paired_DATASET/random_path_list/train/train_rgb_path.npy",
+        'test_mcr_c': "Mono_Colored_RAW_Paired_DATASET/random_path_list/test/test_c_path.npy",
+        'test_mcr_rgb': "Mono_Colored_RAW_Paired_DATASET/random_path_list/test/test_rgb_path.npy",
+        'save_weights_file': "result/SID/weights",
+        'save_images_file': "result/SID/images",
+        'save_csv_file': "result/SID/csv",
+        'log_file': "result/SID/log.txt"
+    }
 
-# Setup directories
-output_dir = 'generated_images'
-os.makedirs(output_dir, exist_ok=True)
-weights_dir = os.path.join(output_dir, 'checkpoints')
-os.makedirs(weights_dir, exist_ok=True)
-logs_dir = os.path.join(output_dir, 'logs')
-os.makedirs(logs_dir, exist_ok=True)
+    # ------------------------------
+    # Automatic device selection
+    # ------------------------------
+    if torch.cuda.is_available():
+        device = torch.device("cuda")
+        n_gpus = torch.cuda.device_count()
+        print(f"Using {n_gpus} GPU(s)")
+    else:
+        device = torch.device("cpu")
+        n_gpus = 0
+        print("Using CPU")
 
-# Device setup
-os.environ["CUDA_VISIBLE_DEVICES"] = config['gpu_ids']
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # Create folders
+    os.makedirs(opt['save_weights_file'], exist_ok=True)
+    os.makedirs(opt['save_images_file'], exist_ok=True)
+    os.makedirs(opt['save_csv_file'], exist_ok=True)
+    os.makedirs(os.path.dirname(opt['log_file']), exist_ok=True)
 
-class ImageGenerator(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.font_size = config['font_size']
-        self.text_color = (0, 0, 0)  # Black text
-        self.bg_color = (255, 255, 255)  # White background
-        
-    def forward(self, text_batch):
-        images = []
-        for text in text_batch:
-            img = Image.new('RGB', config['image_size'], self.bg_color)
-            draw = ImageDraw.Draw(img)
-            
-            try:
-                font = ImageFont.truetype("arialbd.ttf", self.font_size)
-            except:
-                font = ImageFont.load_default()
-            
-            # Format: 4 letters + space + 7 digits
-            parts = [text[:4], ' ', text[4:11]] if len(text) >= 11 else [text]
-            y_pos = 20
-            
-            for part in parts:
-                for char in part:
-                    w, h = draw.textsize(char, font=font)
-                    x_pos = 5 + (config['image_size'][0] - 10 - w) // 2
-                    draw.text((x_pos, y_pos), char, fill=self.text_color, font=font)
-                    y_pos += h + (25 if part == text[:4] and char == part[-1] else 10)
-            
-            # Convert to tensor and normalize
-            img_tensor = torch.from_numpy(np.array(img)).float() / 255.0
-            img_tensor = img_tensor.permute(2, 0, 1)  # HWC to CHW
-            images.append(img_tensor)
-        
-        return torch.stack(images).to(device)
+    log_f = open(opt['log_file'], 'a')
+    log_f.write(f"\nTraining start time: {datetime.datetime.now().isoformat()}\n")
 
-# Initialize model
-model = ImageGenerator().to(device)
+    # ------------------------------
+    # Dataset
+    # ------------------------------
+    if opt['dataset'] == 'SID':
+        train_input_paths = glob.glob(opt['train_sid_short']) + glob.glob("Sony/short/2*_00_0.1s.ARW")
+        train_gt_paths = [os.path.join(opt['train_sid_long'], os.path.basename(x).replace('short', 'long')) for x in train_input_paths]
 
-# Multi-GPU setup
-if config['distributed']:
-    model = DDP(model, device_ids=[config['local_rank']])
-elif torch.cuda.device_count() > 1:
-    model = nn.DataParallel(model)
+        test_input_paths = glob.glob(opt['test_sid_short'])
+        test_gt_paths = [os.path.join(opt['test_sid_long'], os.path.basename(x).replace('short', 'long')) for x in test_input_paths]
 
-# Dataset
-class TextDataset(torch.utils.data.Dataset):
-    def __init__(self, num_samples=10000):
-        self.texts = []
-        for _ in range(num_samples):
-            letters = ''.join(random.choices("ABCDEFGHIJKLMNOPQRSTUVWXYZ", k=4))
-            digits = ''.join(random.choices("0123456789", k=7))
-            self.texts.append(f"{letters}{digits}")
-    
-    def __len__(self):
-        return len(self.texts)
-    
-    def __getitem__(self, idx):
-        return self.texts[idx]
+        train_data = load_data_SID(train_input_paths, train_gt_paths, patch_size=opt['patch_size'], training=True)
+        test_data = load_data_SID(test_input_paths, test_gt_paths, patch_size=opt['patch_size'], training=False)
 
-# Training setup
-dataset = TextDataset(num_samples=10000)
-sampler = DistributedSampler(dataset) if config['distributed'] else None
+    elif opt['dataset'] == 'MCR':
+        train_c_path = np.load(opt['train_mcr_c'], allow_pickle=True).tolist()
+        train_rgb_path = np.load(opt['train_mcr_rgb'], allow_pickle=True).tolist()
+        test_c_path = np.load(opt['test_mcr_c'], allow_pickle=True).tolist()
+        test_rgb_path = np.load(opt['test_mcr_rgb'], allow_pickle=True).tolist()
 
-loader = DataLoader(
-    dataset,
-    batch_size=config['batch_size'],
-    shuffle=(sampler is None),
-    num_workers=config['num_workers'],
-    pin_memory=True,
-    sampler=sampler
-)
+        train_data = load_data_MCR(train_c_path, train_rgb_path, patch_size=opt['patch_size'], training=True)
+        test_data = load_data_MCR(test_c_path, test_rgb_path, patch_size=opt['patch_size'], training=False)
 
-# Loss and optimizer
-criterion = nn.MSELoss()  # Using MSE for demonstration
-optimizer = optim.Adam(model.parameters(), lr=config['base_lr'])
+    dataloader_train = DataLoader(train_data, batch_size=opt['batch_size'], shuffle=True, num_workers=16, pin_memory=True)
+    dataloader_val = DataLoader(test_data, batch_size=opt['batch_size'], shuffle=False, num_workers=16, pin_memory=True)
 
-# Learning rate scheduling
-scheduler_cosine = optim.lr_scheduler.CosineAnnealingLR(
-    optimizer, config['epochs']-config['warmup_epochs'], eta_min=config['min_lr'])
-scheduler = GradualWarmupScheduler(
-    optimizer, multiplier=1, total_epoch=config['warmup_epochs'], after_scheduler=scheduler_cosine)
+    # ------------------------------
+    # Model
+    # ------------------------------
+    dim = {'S': 32, 'B': 48, 'L': 64}[opt['model_size']]
+    model = RawFormer(dim=dim)
 
-# Mixed precision
-scaler = torch.cuda.amp.GradScaler()
+    # Multi-GPU
+    if n_gpus > 1:
+        model = nn.DataParallel(model)
+    model = model.to(device)
 
-# Training loop
-def train():
-    model.train()
-    total_loss = 0
-    
-    for batch in tqdm(loader, disable=config['local_rank'] != 0):
-        optimizer.zero_grad()
-        
-        with torch.cuda.amp.autocast():
-            generated = model(batch)
-            # For demonstration - compare to white images
-            targets = torch.ones_like(generated)
-            loss = criterion(generated, targets)
-        
-        scaler.scale(loss).backward()
-        scaler.step(optimizer)
-        scaler.update()
-        
-        if config['distributed']:
-            dist.all_reduce(loss)
-            loss = loss / world_size
-        total_loss += loss.item()
-    
-    return total_loss / len(loader)
+    optimizer = optim.Adam(model.parameters(), lr=opt['base_lr'])
+    scheduler_cosine = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, opt['epochs'], eta_min=1e-5)
+    scheduler = GradualWarmupScheduler(optimizer, multiplier=1, total_epoch=20, after_scheduler=scheduler_cosine)
 
-# Main execution
-if __name__ == "__main__":
-    if config['local_rank'] == 0:
-        writer = SummaryWriter(log_dir=logs_dir)
-        print(f"Training on {world_size if config['distributed'] else torch.cuda.device_count()} GPUs")
-    
-    for epoch in range(config['epochs']):
-        if config['distributed']:
-            sampler.set_epoch(epoch)
-        
-        epoch_loss = train()
+    scaler = torch.cuda.amp.GradScaler()
+    loss_criterion = CharbonnierLoss()
+
+    start_epoch = 0
+    best_psnr = 0
+    best_epoch = 0
+
+    # ------------------------------
+    # Training loop
+    # ------------------------------
+    for epoch in range(start_epoch, opt['epochs'] + 1):
+        model.train()
+        epoch_loss = 0
+        start_time = time.time()
+
+        for batch in tqdm.tqdm(dataloader_train):
+            optimizer.zero_grad()
+            input_raw = batch[0].to(device)
+            gt_rgb = batch[1].to(device)
+
+            with torch.cuda.amp.autocast():
+                pred_rgb = model(input_raw)
+                pred_rgb = torch.clamp(pred_rgb, 0, 1)
+                loss = loss_criterion(pred_rgb, gt_rgb)
+
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+            epoch_loss += loss.item()
+
         scheduler.step()
-        
-        if config['local_rank'] == 0:
-            # Save sample images
-            if epoch % 10 == 0:
-                with torch.no_grad():
-                    sample_texts = ["REBOD1234567", "ABCD9876543", "TEST0000000"]
-                    samples = model(sample_texts)
-                    for i, (text, img_tensor) in enumerate(zip(sample_texts, samples)):
-                        img = (img_tensor.permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
-                        Image.fromarray(img).save(os.path.join(output_dir, f"epoch_{epoch}_sample_{i}.png"))
-            
-            # Save checkpoint
-            if epoch % 50 == 0:
-                torch.save({
-                    'epoch': epoch,
-                    'model_state': model.module.state_dict() if hasattr(model, 'module') else model.state_dict(),
-                    'optimizer': optimizer.state_dict()
-                }, os.path.join(weights_dir, f"checkpoint_{epoch}.pth"))
-            
-            writer.add_scalar('Loss/train', epoch_loss, epoch)
-            print(f"Epoch {epoch}: Loss={epoch_loss:.4f}")
-    
-    if config['distributed']:
-        dist.destroy_process_group()
+
+        # Validation
+        model.eval()
+        psnr_val_rgb = []
+        with torch.no_grad():
+            for batch in dataloader_val:
+                input_raw = batch[0].to(device)
+                gt_rgb = batch[1].to(device)
+                with torch.cuda.amp.autocast():
+                    pred_rgb = model(input_raw)
+                pred_rgb = torch.clamp(pred_rgb, 0, 1)
+                pred_np = (pred_rgb.cpu().numpy().transpose(0,2,3,1)*255).astype(np.uint8)
+                gt_np = (gt_rgb.cpu().numpy().transpose(0,2,3,1)*255).astype(np.uint8)
+                for p,g in zip(pred_np, gt_np):
+                    psnr_val_rgb.append(PSNR(g,p))
+
+        avg_psnr = np.mean(psnr_val_rgb)
+        if avg_psnr > best_psnr:
+            best_psnr = avg_psnr
+            best_epoch = epoch
+            torch.save({
+                'epoch': epoch,
+                'state_dict': model.state_dict(),
+                'optimizer': optimizer.state_dict()
+            }, os.path.join(opt['save_weights_file'], "model_best.pth"))
+
+        epoch_time = time.time()-start_time
+        log_f.write(f"Epoch {epoch}/{opt['epochs']} | Time: {epoch_time:.2f}s | Loss: {epoch_loss:.4f} | Avg PSNR: {avg_psnr:.4f} | Best PSNR: {best_psnr:.4f} (Epoch {best_epoch})\n")
+        log_f.flush()
+
+        if epoch % 50 == 0 or epoch == opt['epochs']:
+            torch.save({
+                'epoch': epoch,
+                'state_dict': model.state_dict(),
+                'optimizer': optimizer.state_dict()
+            }, os.path.join(opt['save_weights_file'], f"model_{epoch}.pth"))
+
+    log_f.write(f"Training finished at: {datetime.datetime.now().isoformat()}\n")
+    log_f.close()
