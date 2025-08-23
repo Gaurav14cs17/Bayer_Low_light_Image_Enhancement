@@ -1,359 +1,210 @@
 import rawpy
+from torch.utils.data import Dataset
 import tqdm
 import random
+import imageio
 import numpy as np
 import torch
-from torch.utils.data import Dataset, DataLoader
-import imageio
 import os
+import time
 from PIL import Image
 
-# ------------------------------
-# Enhanced Bayer pattern detection
-# ------------------------------
-def detect_bayer_pattern_from_metadata(raw):
-    """Try to detect Bayer pattern from raw file metadata"""
-    try:
-        # Try to get pattern from raw pattern attribute
-        if hasattr(raw, 'raw_pattern'):
-            pattern_map = {0: 'R', 1: 'G', 2: 'B', 3: 'G'}
-            pattern = ''
-            for i in range(2):
-                for j in range(2):
-                    pattern += pattern_map[raw.raw_pattern[i, j]]
-            return pattern
-        
-        # Try to get pattern from color description
-        if hasattr(raw, 'color_desc'):
-            pattern = raw.color_desc.decode('utf-8', errors='ignore')
-            if len(pattern) >= 4 and all(c in 'RGBG' for c in pattern[:4]):
-                return pattern[:4].upper()
-                
-    except Exception as e:
-        print(f"Error detecting pattern: {e}")
-    
-    return None
 
-# ------------------------------
-# Pack RAW into 4 channels (RGGB) with enhanced handling
-# ------------------------------
-def pack_raw(raw, pattern="RGGB"):
-    """
-    Pack Bayer RAW into 4 channels with pattern-aware packing.
-    Maintains correct channel order and alignment.
-    """
-    im = raw.raw_image_visible.astype(np.float32)
-    
-    # Get black and white levels
-    black_level = np.array(raw.black_level_per_channel)
-    white_level = raw.white_level
-    
-    # Handle different black level configurations
-    if len(black_level) == 4:
-        # Separate black levels for each channel
-        black_level = black_level.reshape(2, 2)
-    else:
-        # Single black level for all channels
-        black_level = np.full((2, 2), black_level[0])
-    
-    # Ensure even dimensions
-    H, W = im.shape
-    H -= H % 2
-    W -= W % 2
-    im = im[:H, :W]
-    
-    # Pattern-aware packing
-    pattern = pattern.upper()
-    if pattern == "RGGB":
-        channels = [
-            im[0:H:2, 0:W:2],  # R
-            im[0:H:2, 1:W:2],  # G1
-            im[1:H:2, 1:W:2],  # B
-            im[1:H:2, 0:W:2]   # G2
-        ]
-        black_levels = [
-            black_level[0, 0],  # R
-            black_level[0, 1],  # G1
-            black_level[1, 1],  # B
-            black_level[1, 0]   # G2
-        ]
-    elif pattern == "BGGR":
-        channels = [
-            im[1:H:2, 1:W:2],  # R
-            im[0:H:2, 1:W:2],  # G1
-            im[0:H:2, 0:W:2],  # B
-            im[1:H:2, 0:W:2]   # G2
-        ]
-        black_levels = [
-            black_level[1, 1],  # R
-            black_level[0, 1],  # G1
-            black_level[0, 0],  # B
-            black_level[1, 0]   # G2
-        ]
-    elif pattern == "GRBG":
-        channels = [
-            im[0:H:2, 1:W:2],  # R
-            im[0:H:2, 0:W:2],  # G1
-            im[1:H:2, 0:W:2],  # B
-            im[1:H:2, 1:W:2]   # G2
-        ]
-        black_levels = [
-            black_level[0, 1],  # R
-            black_level[0, 0],  # G1
-            black_level[1, 0],  # B
-            black_level[1, 1]   # G2
-        ]
-    elif pattern == "GBRG":
-        channels = [
-            im[1:H:2, 0:W:2],  # R
-            im[0:H:2, 0:W:2],  # G1
-            im[0:H:2, 1:W:2],  # B
-            im[1:H:2, 1:W:2]   # G2
-        ]
-        black_levels = [
-            black_level[1, 0],  # R
-            black_level[0, 0],  # G1
-            black_level[0, 1],  # B
-            black_level[1, 1]   # G2
-        ]
-    else:
-        raise ValueError(f"Unknown Bayer pattern: {pattern}")
-    
-    # Subtract pattern-specific black levels and normalize
-    out = np.stack([
-        np.maximum(channels[i] - black_levels[i], 0) / max(white_level - black_levels[i], 1e-6)
-        for i in range(4)
-    ], axis=0)
-    
-    return out  # shape: (4, H/2, W/2)
+class AverageMeter:
+    def __init__(self):
+        self.reset()
 
-# ------------------------------
-# Enhanced color correction
-# ------------------------------
-def correct_bayer_channels(rgb, pattern="RGGB", auto_detect=True):
-    """
-    Enhanced Bayer channel correction with auto-detection
-    """
-    if auto_detect:
-        # Auto-detect if pattern seems wrong based on color statistics
-        r_mean = rgb[..., 0].mean()
-        b_mean = rgb[..., 2].mean()
-        g_mean = rgb[..., 1].mean()
-        
-        # If blue is significantly stronger than red, we might need to swap
-        if b_mean > r_mean * 1.8 and g_mean > max(r_mean, b_mean) * 0.8:
-            if pattern in ["RGGB", "GRBG"]:
-                pattern = "BGGR" if pattern == "RGGB" else "GBRG"
-            elif pattern in ["BGGR", "GBRG"]:
-                pattern = "RGGB" if pattern == "BGGR" else "GRBG"
-    
-    pattern = pattern.upper()
-    if pattern == "BGGR":
-        rgb = rgb[..., [2, 1, 0]]  # Swap R/B
-    elif pattern == "GBRG":
-        rgb = rgb[..., [1, 0, 2]]  # GBRG → RGB
-    elif pattern == "GRBG":
-        rgb = rgb[..., [0, 2, 1]]  # GRBG → RGB
-    
-    return rgb
+    def reset(self):
+        self.val, self.avg, self.sum, self.count = 0, 0, 0, 0
 
-def auto_correct_color_balance(rgb):
-    """
-    More sophisticated auto color correction
-    """
-    # Simple auto white balance based on gray world assumption
-    r, g, b = rgb[..., 0], rgb[..., 1], rgb[..., 2]
-    r_avg, g_avg, b_avg = r.mean(), g.mean(), b.mean()
-    
-    # Avoid division by zero and extreme values
-    r_scale = g_avg / max(r_avg, 1e-6)
-    b_scale = g_avg / max(b_avg, 1e-6)
-    
-    # Apply gentle correction
-    rgb[..., 0] = np.clip(r * min(r_scale, 2.0), 0, 1)
-    rgb[..., 2] = np.clip(b * min(b_scale, 2.0), 0, 1)
-    
-    return rgb
+    def update(self, val, n=1):
+        self.val = val
+        self.sum += val * n
+        self.count += n
+        self.avg = self.sum / self.count
 
-# ------------------------------
-# Enhanced SID Dataset
-# ------------------------------
-class EnhancedLoadDataSID(Dataset):
-    def __init__(self, short_expo_files, long_expo_files, patch_size=512, 
-                 training=True, bayer_pattern="RGGB", use_pattern_detection=True):
+
+class SID_Dataset(Dataset):
+    """Improved SID Dataset with proper RAW processing and memory management"""
+
+    def __init__(self, short_expo_files, long_expo_files, patch_size=512, training=True,
+                 use_camera_wb=False, gt_png=False):
+        """
+        short_expo_files: list of short exposure RAW file paths
+        long_expo_files: list of long exposure RAW file paths
+        patch_size: size for random cropping during training
+        training: whether in training mode
+        use_camera_wb: whether to use camera white balance
+        gt_png: whether GT is in PNG format (demosaiced)
+        """
         self.training = training
         self.patch_size = patch_size
-        self.short_expo_files = short_expo_files
-        self.long_expo_files = long_expo_files
-        self.bayer_pattern = bayer_pattern
-        self.use_pattern_detection = use_pattern_detection
+        self.use_camera_wb = use_camera_wb
+        self.gt_png = gt_png
 
-        if self.training:
-            print("\n...... Enhanced Train files loading\n")
-        else:
-            print("\n...... Enhanced Test files loading\n")
+        # Store file paths instead of loading all images to memory
+        self.short_files = short_expo_files
+        self.long_files = long_expo_files
 
-        # Preload all images into RAM
-        self.short_list = []
-        self.long_list = []
-        self.pattern_list = []
+        # Timing meters
+        self.raw_read_time = AverageMeter()
+        self.raw_process_time = AverageMeter()
 
-        for i in tqdm.tqdm(range(len(short_expo_files))):
-            short_path = short_expo_files[i]
-            long_path = long_expo_files[i]
-            
-            # Load short exposure RAW
-            raw_short = rawpy.imread(short_path)
-            
-            # Detect pattern if enabled
-            if self.use_pattern_detection:
-                detected_pattern = detect_bayer_pattern_from_metadata(raw_short)
-                actual_pattern = detected_pattern if detected_pattern else bayer_pattern
-            else:
-                actual_pattern = bayer_pattern
-                
-            self.pattern_list.append(actual_pattern)
-            
-            # Pack RAW with correct pattern
-            im_short = pack_raw(raw_short, actual_pattern)
-            raw_short.close()
-            self.short_list.append(im_short)
-
-            # Load long exposure RGB GT
-            raw_long = rawpy.imread(long_path)
-            im_long = raw_long.postprocess(
-                use_camera_wb=True, 
-                half_size=False,  # Changed to False for better alignment
-                no_auto_bright=True, 
-                output_bps=16
-            ).copy()
-            raw_long.close()
-            
-            # Convert and correct
-            im_long = im_long.astype(np.float32) / 65535.0
-            im_long = correct_bayer_channels(im_long, actual_pattern, auto_detect=True)
-            im_long = auto_correct_color_balance(im_long)
-            self.long_list.append(im_long)
-
-        print(f"\nFiles loaded: {len(self.short_list)} samples")
-        print(f"Detected patterns: {set(self.pattern_list)}\n")
+        print(f'\n...... {"Train" if training else "Test"} files initialized ({len(self.short_files)} pairs)\n')
 
     def __len__(self):
-        return len(self.short_list)
+        return len(self.short_files)
+
+    def pack_raw(self, raw):
+        """Pack Sony RAW image into 4-channel format"""
+        black = np.array(raw.black_level_per_channel)[:, None, None]
+        white = raw.white_level
+        im = raw.raw_image_visible.astype(np.float32)
+        im = (im - black.min()) / (white - black.min())
+        im = np.clip(im, 0, 1)
+
+        im = np.expand_dims(im, axis=2)
+        H, W, _ = im.shape
+        out = np.concatenate((im[0:H:2, 0:W:2, :],
+                              im[0:H:2, 1:W:2, :],
+                              im[1:H:2, 1:W:2, :],
+                              im[1:H:2, 0:W:2, :]), axis=2)
+        return out
 
     def __getitem__(self, idx):
-        im_short = self.short_list[idx].copy()
-        im_long = self.long_list[idx].copy()
+        start_time = time.time()
+        
+        # Load and process short exposure RAW
+        with rawpy.imread(self.short_files[idx]) as raw:
+            # Extract exposure information from filename
+            filename = os.path.basename(self.short_files[idx])
+            short_exp = float(filename[9:-4])
+            long_exp = float(os.path.basename(self.long_files[idx])[9:-4])
+            ratio = min(long_exp / short_exp, 300)
+            
+            # Pack RAW and apply ratio (only once)
+            img_short = self.pack_raw(raw) * ratio
+        
+        self.raw_read_time.update(time.time() - start_time)
+        
+        start_time = time.time()
 
-        # Exposure scaling using filename
-        filename = str(self.long_expo_files[idx])
-        ap = 300 if '100' not in filename else 100  # More robust filename parsing
-        im_short = im_short * ap
+        # Load ground truth
+        if self.gt_png:
+            img_long = np.array(Image.open(self.long_files[idx]), dtype=np.float32) / 255.0
+        else:
+            with rawpy.imread(self.long_files[idx]) as raw:
+                img_long = raw.postprocess(use_camera_wb=True, half_size=False, no_auto_bright=True, output_bps=16)
+                img_long = np.float32(img_long / 65535.0)
 
-        C, H, W = im_short.shape
-        H_rgb, W_rgb, _ = im_long.shape
+        self.raw_process_time.update(time.time() - start_time)
 
-        # Ensure RGB and RAW have compatible dimensions
-        if H != H_rgb or W != W_rgb:
-            # Resize RGB to match RAW dimensions
-            im_long = np.transpose(im_long, (2, 0, 1))  # (3, H, W)
-            im_long = torch.from_numpy(im_long).unsqueeze(0)
-            im_long = torch.nn.functional.interpolate(
-                im_long, size=(H, W), mode='bilinear', align_corners=False
-            ).squeeze(0).numpy()
-            im_long = np.transpose(im_long, (1, 2, 0))  # (H, W, 3)
+        # Clamp values
+        img_short = np.minimum(img_short, 1.0)
 
-        # Random crop & augmentation
-        if self.training and H >= self.patch_size and W >= self.patch_size:
-            i = random.randint(0, H - self.patch_size)
-            j = random.randint(0, W - self.patch_size)
-            im_short = im_short[:, i:i+self.patch_size, j:j+self.patch_size]
-            im_long = im_long[i:i+self.patch_size, j:j+self.patch_size, :]
+        # Convert to channel-first format
+        img_short = img_short.transpose(2, 0, 1)  # HWC to CHW
+        img_long = img_long.transpose(2, 0, 1)
+
+        H, W = img_short.shape[1], img_short.shape[2]
+
+        # Data augmentation for training
+        if self.training and self.patch_size:
+            # Ensure crop coordinates are even for Bayer pattern alignment
+            yy = random.randint(0, (H - self.patch_size) // 2) * 2
+            xx = random.randint(0, (W - self.patch_size) // 2) * 2
+
+            img_short = img_short[:, yy:yy + self.patch_size, xx:xx + self.patch_size]
+
+            # GT might be different resolution
+            if img_long.shape[1] == H * 2:
+                img_long = img_long[:, yy * 2:(yy + self.patch_size) * 2, xx * 2:(xx + self.patch_size) * 2]
+            else:
+                img_long = img_long[:, yy:yy + self.patch_size, xx:xx + self.patch_size]
 
             # Random flips
             if random.random() > 0.5:
-                im_short = np.flip(im_short, axis=2).copy()  # horizontal flip
-                im_long = np.flip(im_long, axis=1).copy()
-            if random.random() < 0.2:
-                im_short = np.flip(im_short, axis=1).copy()  # vertical flip
-                im_long = np.flip(im_long, axis=0).copy()
+                img_short = np.flip(img_short, axis=2)
+                img_long = np.flip(img_long, axis=2)
+            if random.random() > 0.5:
+                img_short = np.flip(img_short, axis=1)
+                img_long = np.flip(img_long, axis=1)
+            if random.random() > 0.5:
+                img_short = np.transpose(img_short, (0, 2, 1))
+                img_long = np.transpose(img_long, (0, 2, 1))
 
-        # Convert to tensors
-        im_short_tensor = torch.from_numpy(im_short).float()  # (4, H, W)
-        im_long_tensor = torch.from_numpy(np.transpose(im_long, (2, 0, 1))).float()  # (3, H, W)
+        # Convert to torch tensors
+        img_short_tensor = torch.from_numpy(img_short).float()
+        img_long_tensor = torch.from_numpy(img_long).float()
 
-        return im_short_tensor, im_long_tensor
+        return img_short_tensor, img_long_tensor
 
-# ------------------------------
-# Debug and test functions
-# ------------------------------
-def diagnose_image(image_path):
-    """Diagnose raw image metadata"""
-    try:
-        raw = rawpy.imread(image_path)
-        print(f"\nDiagnosing: {os.path.basename(image_path)}")
-        print(f"Color description: {getattr(raw, 'color_desc', 'N/A')}")
-        if hasattr(raw, 'color_desc'):
-            try:
-                print(f"Color desc decoded: {raw.color_desc.decode('utf-8', errors='ignore')}")
-            except:
-                pass
-        print(f"Raw pattern: {getattr(raw, 'raw_pattern', 'N/A')}")
-        print(f"Black levels: {getattr(raw, 'black_level_per_channel', 'N/A')}")
-        print(f"White level: {getattr(raw, 'white_level', 'N/A')}")
-        raw.close()
-    except Exception as e:
-        print(f"Error diagnosing {image_path}: {e}")
 
-def test_enhanced_loader(short_files, long_files, save_dir="./debug_out"):
-    """Test the enhanced loader with visualization"""
-    os.makedirs(save_dir, exist_ok=True)
-    
-    # Diagnose images first
-    for short_file, long_file in zip(short_files, long_files):
-        print("=" * 50)
-        diagnose_image(short_file)
-        diagnose_image(long_file)
-    
-    # Load dataset
-    dataset = EnhancedLoadDataSID(
-        short_files, long_files, 
-        patch_size=512, 
-        training=True,
-        use_pattern_detection=True
-    )
-    
-    loader = DataLoader(dataset, batch_size=1, shuffle=True)
+class MCR_Dataset(Dataset):
+    """Improved MCR Dataset with proper processing"""
 
-    for idx, (raw_pack, gt_rgb) in enumerate(loader):
-        raw_np = raw_pack[0].numpy()  # (4, H, W)
-        gt_np = gt_rgb[0].numpy().transpose(1, 2, 0)  # (H, W, 3)
+    def __init__(self, train_c_path, train_rgb_path, patch_size=512, training=True):
+        self.training = training
+        self.patch_size = patch_size
+        self.train_c_path = train_c_path
+        self.train_rgb_path = train_rgb_path
 
-        # Visualize all 4 RAW channels
-        for ch in range(4):
-            channel_img = raw_np[ch] / raw_np[ch].max() * 255
-            imageio.imwrite(f"{save_dir}/raw_ch{ch}_{idx}.png", channel_img.astype(np.uint8))
-        
-        # Save RGB
-        imageio.imwrite(f"{save_dir}/gt_{idx}.png", (gt_np * 255).astype(np.uint8))
-        
-        print(f"Saved debug images for sample {idx}")
-        if idx >= 2:  # Just check a couple of samples
-            break
+        print(f'\n...... {"Train" if training else "Test"} files initialized ({len(self.train_c_path)} pairs)\n')
 
-# ------------------------------
-# Example Usage
-# ------------------------------
-if __name__ == "__main__":
-    # Example file paths
-    short_files = ["./dataset/Sony/short_expo/0001.ARW", "./dataset/Sony/short_expo/0002.ARW"]
-    long_files = ["./dataset/Sony/long_expo/0001.ARW", "./dataset/Sony/long_expo/0002.ARW"]
-    
-    # Filter out non-existent files
-    short_files = [f for f in short_files if os.path.exists(f)]
-    long_files = [f for f in long_files if os.path.exists(f)]
-    
-    if short_files and long_files:
-        test_enhanced_loader(short_files, long_files)
-    else:
-        print("No valid files found. Please check your file paths.")
+    def __len__(self):
+        return len(self.train_c_path)
+
+    def __getitem__(self, idx):
+        # Load images on-the-fly to save memory
+        inp_raw_image = imageio.imread(self.train_c_path[idx]).astype(np.float32)
+        gt_rgb_image = imageio.imread(self.train_rgb_path[idx]).astype(np.float32)
+
+        # Extract exposure information from filename
+        filename = os.path.basename(self.train_c_path[idx])
+        img_num = int(filename[-23:-20])
+        img_expo = int(filename[-8:-4], 16)
+
+        # Determine ground truth exposure
+        gt_expo = 12287 if img_num < 500 else 1023
+        amp = gt_expo / img_expo
+
+        # Apply amplification
+        inp_raw_image = (inp_raw_image / 255 * amp)
+        gt_rgb_image = gt_rgb_image / 255
+
+        H, W = inp_raw_image.shape
+
+        # Data augmentation for training
+        if self.training and self.patch_size:
+            # Ensure even coordinates for proper Bayer pattern handling
+            i = random.randint(0, (H - self.patch_size - 2) // 2) * 2
+            j = random.randint(0, (W - self.patch_size - 2) // 2) * 2
+
+            inp_raw = inp_raw_image[i:i + self.patch_size, j:j + self.patch_size]
+            gt_rgb = gt_rgb_image[i:i + self.patch_size, j:j + self.patch_size, :]
+
+            # Random flips
+            if random.random() > 0.5:
+                inp_raw = np.fliplr(inp_raw)
+                gt_rgb = np.fliplr(gt_rgb)
+            if random.random() > 0.2:  # More reasonable probability
+                inp_raw = np.flipud(inp_raw)
+                gt_rgb = np.flipud(gt_rgb)
+        else:
+            inp_raw = inp_raw_image
+            gt_rgb = gt_rgb_image
+
+        # Convert to torch tensors
+        gt_tensor = torch.from_numpy(gt_rgb.transpose(2, 0, 1)).float()
+        inp_tensor = torch.from_numpy(inp_raw).float().unsqueeze(0)
+
+        return inp_tensor, gt_tensor
+
+
+# Helper function for backward compatibility
+def load_data_SID(short_expo_files, long_expo_files, patch_size=512, training=True, **kwargs):
+    return SID_Dataset(short_expo_files, long_expo_files, patch_size, training, **kwargs)
+
+
+def load_data_MCR(train_c_path, train_rgb_path, patch_size=512, training=True):
+    return MCR_Dataset(train_c_path, train_rgb_path, patch_size, training)
