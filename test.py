@@ -1,170 +1,143 @@
 import torch
-import torch.nn as nn
 from torch.utils.data import DataLoader
-import torch.optim as optim
 from skimage.metrics import peak_signal_noise_ratio as PSNR
-from warmup_scheduler import GradualWarmupScheduler
+from skimage.metrics import structural_similarity as SSIM
+
 import numpy as np
 import os
 import tqdm
+import imageio
 import glob
-import time
-import datetime
 from model import RawFormer
 from load_dataset import load_data_MCR, load_data_SID
 
-class CharbonnierLoss(nn.Module):
-    """Charbonnier Loss (L1)"""
-    def __init__(self, eps=1e-3):
-        super(CharbonnierLoss, self).__init__()
-        self.eps = eps
+# ------------------------------
+# Bayer CFA handling
+# ------------------------------
+def correct_bayer_channels(rgb, pattern="RGGB"):
+    """
+    Ensure correct RGB channel order based on Bayer pattern.
+    """
+    pattern = pattern.upper()
+    if pattern == "BGGR":
+        rgb = rgb[..., [2, 1, 0]]  # Swap R and B
+    elif pattern == "GBRG":
+        rgb = rgb[..., [1, 0, 2]]  # Adjust mapping
+    elif pattern == "GRBG":
+        rgb = rgb[..., [0, 2, 1]]  # Adjust mapping
+    # RGGB → keep as is
+    return rgb
 
-    def forward(self, x, y):
-        diff = x - y
-        loss = torch.mean(torch.sqrt(diff * diff + self.eps * self.eps))
-        return loss
+def auto_correct_rb(rgb):
+    """
+    Automatically swaps R/B if the red channel is darker than blue.
+    Useful for natural images where R is normally stronger than B.
+    """
+    r_mean = rgb[..., 0].mean()
+    b_mean = rgb[..., 2].mean()
+    if r_mean < b_mean:
+        rgb = rgb[..., [2, 1, 0]]
+    return rgb
 
+# ------------------------------
+# Main testing pipeline
+# ------------------------------
 if __name__ == '__main__':
-    opt = {
-        'gpu_id': '0',
-        'base_lr': 1e-4,
-        'batch_size': 16,
-        'dataset': 'SID',   # 'SID' or 'MCR'
-        'patch_size': 512,
-        'model_size': 'S',  # S/B/L
-        'epochs': 3000,
-        'train_sid_short': "Sony/short/0*_00_0.1s.ARW",  # training short exposure
-        'train_sid_long': "Sony/long/",                  # training long exposure folder
-        'test_sid_short': "Sony/short/1*_00_0.1s.ARW",   # testing short exposure
-        'test_sid_long': "Sony/long/",                  # testing long exposure folder
-        'train_mcr_c': "Mono_Colored_RAW_Paired_DATASET/random_path_list/train/train_c_path.npy",
-        'train_mcr_rgb': "Mono_Colored_RAW_Paired_DATASET/random_path_list/train/train_rgb_path.npy",
-        'test_mcr_c': "Mono_Colored_RAW_Paired_DATASET/random_path_list/test/test_c_path.npy",
-        'test_mcr_rgb': "Mono_Colored_RAW_Paired_DATASET/random_path_list/test/test_rgb_path.npy",
-        'save_weights_file': "result/SID/weights",
-        'save_images_file': "result/SID/images",
-        'save_csv_file': "result/SID/csv",
-        'log_file': "result/SID/log.txt"
-    }
+    opt = {}
+    opt['dataset'] = 'MCR'           # 'MCR' or 'SID'
+    opt['use_gpu'] = True
+    opt['gpu_id'] = '0'
+    opt['model_size'] = 'S'          # S / B / L
+    opt['bayer_pattern'] = "RGGB"    # Dataset Bayer pattern
 
-    os.environ["CUDA_VISIBLE_DEVICES"] = opt['gpu_id']
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-    # Create folders if not exist
-    os.makedirs(opt['save_weights_file'], exist_ok=True)
-    os.makedirs(opt['save_images_file'], exist_ok=True)
-    os.makedirs(opt['save_csv_file'], exist_ok=True)
-    os.makedirs(os.path.dirname(opt['log_file']), exist_ok=True)
-
-    log_f = open(opt['log_file'], 'a')
-    log_f.write(f"\nTraining start time: {datetime.datetime.now().isoformat()}\n")
-
-    use_pretrain = False
-    pretrain_weights = os.path.join(opt['save_weights_file'], 'model_2000.pth')
+    save_weights_file = os.path.join('result', opt['dataset'], 'weights')
+    save_images_file = os.path.join('result', opt['dataset'], 'images')
+    save_csv_file = os.path.join('result', opt['dataset'], 'csv')
 
     # ------------------------------
-    # Dataset
+    # Load test dataset
     # ------------------------------
     if opt['dataset'] == 'SID':
-        train_input_paths = glob.glob(opt['train_sid_short'].replace("\\", "/")) + glob.glob("Sony/short/2*_00_0.1s.ARW")
-        train_gt_paths = [os.path.join(opt['train_sid_long'], os.path.basename(x).replace('short', 'long')) for x in train_input_paths]
-
-        test_input_paths = glob.glob(opt['test_sid_short'])
-        test_gt_paths = [os.path.join(opt['test_sid_long'], os.path.basename(x).replace('short', 'long')) for x in test_input_paths]
-
-        train_data = load_data_SID(train_input_paths, train_gt_paths, patch_size=opt['patch_size'], training=True)
-        test_data = load_data_SID(test_input_paths, test_gt_paths, patch_size=opt['patch_size'], training=False)
+        test_input_paths = glob.glob(os.path.join('Sony/short/', '*.ARW'))
+        test_gt_paths = [x.replace('short', 'long') for x in test_input_paths]
+        print(f'Test data: {len(test_input_paths)} pairs')
+        test_data = load_data_SID(test_input_paths, test_gt_paths, training=False)
 
     elif opt['dataset'] == 'MCR':
-        train_c_path = np.load(opt['train_mcr_c'], allow_pickle=True).tolist()
-        train_rgb_path = np.load(opt['train_mcr_rgb'], allow_pickle=True).tolist()
-        test_c_path = np.load(opt['test_mcr_c'], allow_pickle=True).tolist()
-        test_rgb_path = np.load(opt['test_mcr_rgb'], allow_pickle=True).tolist()
+        test_c_path = np.load('Mono_Colored_RAW_Paired_DATASET/random_path_list/test/test_c_path.npy', allow_pickle=True)
+        test_rgb_path = np.load('Mono_Colored_RAW_Paired_DATASET/random_path_list/test/test_rgb_path.npy', allow_pickle=True)
+        print(f'Test data: {len(test_c_path)} pairs')
+        test_data = load_data_MCR(test_c_path.tolist(), test_rgb_path.tolist(), training=False)
 
-        train_data = load_data_MCR(train_c_path, train_rgb_path, patch_size=opt['patch_size'], training=True)
-        test_data = load_data_MCR(test_c_path, test_rgb_path, patch_size=opt['patch_size'], training=False)
-
-    dataloader_train = DataLoader(train_data, batch_size=opt['batch_size'], shuffle=True, num_workers=16, pin_memory=True)
-    dataloader_val = DataLoader(test_data, batch_size=opt['batch_size'], shuffle=False, num_workers=16, pin_memory=True)
+    dataloader_test = DataLoader(test_data, batch_size=1, shuffle=False, pin_memory=True)
 
     # ------------------------------
-    # Model
+    # Device setup
+    # ------------------------------
+    device = torch.device("cuda" if opt['use_gpu'] and torch.cuda.is_available() else "cpu")
+    if device.type == 'cuda':
+        os.environ["CUDA_VISIBLE_DEVICES"] = opt['gpu_id']
+        torch.cuda.empty_cache()
+
+    # ------------------------------
+    # Model setup
     # ------------------------------
     dim = {'S': 32, 'B': 48, 'L': 64}[opt['model_size']]
     model = RawFormer(dim=dim).to(device)
 
-    optimizer = optim.Adam(model.parameters(), lr=opt['base_lr'])
-    scheduler_cosine = optim.lr_scheduler.CosineAnnealingLR(optimizer, opt['epochs'], eta_min=1e-5)
-    scheduler = GradualWarmupScheduler(optimizer, multiplier=1, total_epoch=20, after_scheduler=scheduler_cosine)
+    checkpoint_path = os.path.join(save_weights_file, f'RawFormer_{opt["model_size"]}_{opt["dataset"]}.pth')
+    checkpoint = torch.load(checkpoint_path, map_location=device)
+    state_dict = {k.replace('module.', ''): v for k, v in checkpoint['state_dict'].items()}
+    model.load_state_dict(state_dict, strict=True)
+    epoch = checkpoint.get('epoch', 0)
+    print('Loaded model from epoch:', epoch)
 
-    scaler = torch.cuda.amp.GradScaler()
-    loss_criterion = CharbonnierLoss()
-
-    start_epoch = 0
-    best_psnr = 0
-    best_epoch = 0
+    model.eval()
 
     # ------------------------------
-    # Training loop
+    # Testing loop
     # ------------------------------
-    for epoch in range(start_epoch, opt['epochs'] + 1):
-        model.train()
-        epoch_loss = 0
-        start_time = time.time()
+    psnr_val_rgb = []
+    ssim_val_rgb = []
 
-        for batch in tqdm.tqdm(dataloader_train):
-            optimizer.zero_grad()
-            input_raw = batch[0].to(device)
-            gt_rgb = batch[1].to(device)
+    os.makedirs(save_images_file, exist_ok=True)
+    os.makedirs(save_csv_file, exist_ok=True)
 
-            with torch.cuda.amp.autocast():
-                pred_rgb = model(input_raw)
-                pred_rgb = torch.clamp(pred_rgb, 0, 1)
-                loss = loss_criterion(pred_rgb, gt_rgb)
+    with torch.no_grad():
+        for ii, (inp_tensor, gt_tensor) in enumerate(tqdm.tqdm(dataloader_test)):
+            inp_tensor = inp_tensor.to(device)
 
-            scaler.scale(loss).backward()
-            scaler.step(optimizer)
-            scaler.update()
-            epoch_loss += loss.item()
+            # Ground truth
+            rgb_gt = (gt_tensor[0].cpu().numpy().transpose(1, 2, 0) * 255).astype(np.uint8)
+            rgb_gt = correct_bayer_channels(rgb_gt, opt['bayer_pattern'])
+            rgb_gt = auto_correct_rb(rgb_gt)
 
-        scheduler.step()
-        # ------------------------------
-        # Validation
-        # ------------------------------
-        model.eval()
-        psnr_val_rgb = []
-        with torch.no_grad():
-            for batch in dataloader_val:
-                input_raw = batch[0].to(device)
-                gt_rgb = batch[1].to(device)
-                with torch.cuda.amp.autocast():
-                    pred_rgb = model(input_raw)
-                pred_rgb = torch.clamp(pred_rgb, 0, 1)
-                pred_np = (pred_rgb.cpu().numpy().transpose(0, 2, 3, 1) * 255).astype(np.uint8)
-                gt_np = (gt_rgb.cpu().numpy().transpose(0, 2, 3, 1) * 255).astype(np.uint8)
-                for p, g in zip(pred_np, gt_np):
-                    psnr_val_rgb.append(PSNR(g, p))
+            # Model prediction
+            pred_rgb = model(inp_tensor)
+            pred_rgb = torch.clamp(pred_rgb, 0, 1)
+            pred_rgb = (pred_rgb[0].cpu().numpy().transpose(1, 2, 0) * 255).astype(np.uint8)
+            pred_rgb = correct_bayer_channels(pred_rgb, opt['bayer_pattern'])
+            pred_rgb = auto_correct_rb(pred_rgb)
 
-        avg_psnr = np.mean(psnr_val_rgb)
-        if avg_psnr > best_psnr:
-            best_psnr = avg_psnr
-            best_epoch = epoch
-            torch.save({
-                'epoch': epoch,
-                'state_dict': model.state_dict(),
-                'optimizer': optimizer.state_dict()
-            }, os.path.join(opt['save_weights_file'], "model_best.pth"))
+            # Metrics
+            psnr = PSNR(pred_rgb, rgb_gt)
+            ssim = SSIM(pred_rgb, rgb_gt, channel_axis=-1)
+            print(f'image:{ii}\tPSNR:{psnr:.4f}\tSSIM:{ssim:.4f}')
+            psnr_val_rgb.append(psnr)
+            ssim_val_rgb.append(ssim)
 
-        epoch_time = time.time() - start_time
-        log_f.write(f"Epoch {epoch}/{opt['epochs']} | Time: {epoch_time:.2f}s | Loss: {epoch_loss:.4f} | Avg PSNR: {avg_psnr:.4f} | Best PSNR: {best_psnr:.4f} (Epoch {best_epoch})\n")
-        log_f.flush()
+            # Save images
+            imageio.imwrite(os.path.join(save_images_file, f'e{epoch}_{ii}_gt.jpg'), rgb_gt)
+            imageio.imwrite(os.path.join(save_images_file, f'e{epoch}_{ii}_psnr_{psnr:.4f}_ssim_{ssim:.4f}.jpg'), pred_rgb)
 
-        if epoch % 50 == 0 or epoch == opt['epochs']:
-            torch.save({
-                'epoch': epoch,
-                'state_dict': model.state_dict(),
-                'optimizer': optimizer.state_dict()
-            }, os.path.join(opt['save_weights_file'], f"model_{epoch}.pth"))
+    # ------------------------------
+    # Average metrics
+    # ------------------------------
+    psnr_average = np.mean(psnr_val_rgb)
+    ssim_average = np.mean(ssim_val_rgb)
+    print(f"Average PSNR: {psnr_average:.4f}, Average SSIM: {ssim_average:.4f}")
 
-    log_f.write(f"Training finished at: {datetime.datetime.now().isoformat()}\n")
-    log_f.close()
+    # Save CSV
+    np.savetxt(os.path.join(save_csv_file, 'test_metrics.csv'),
+               np.column_stack((psnr_val_rgb, ssim_val_rgb)),
+               delimiter=',', fmt='%.4f')
