@@ -1,9 +1,11 @@
+
+
+
 import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
-# Removed ptflops import since it's not essential for core functionality
 
 # -----------------------
 # utils
@@ -72,60 +74,61 @@ class EnhancedBayerProcessor(nn.Module):
         super().__init__()
         self.eps = eps
 
-        # Learnable white balance gains (camera-specific)
-        self.wb_gains = nn.Parameter(torch.tensor([1.0, 1.0, 1.0, 1.0], dtype=torch.float32))  # R, G1, G2, B
+        # Learnable white balance gains (camera-typical init: R/B slightly > G)
+        self.wb_gains = nn.Parameter(torch.tensor([1.8, 1.0, 1.0, 1.6], dtype=torch.float32))  # R, G1, G2, B
 
-        # Learnable color matrix (3x4 for RGB conversion: 3x3 matrix + 3x1 offset)
-        self.color_matrix = nn.Parameter(torch.cat([torch.eye(3, 3, dtype=torch.float32), torch.zeros(3, 1)], dim=1))
+        # Learnable color matrix (3x4: 3x3 matrix + 3x1 bias)
+        self.color_matrix = nn.Parameter(torch.cat([torch.eye(3, 3, dtype=torch.float32),
+                                                    torch.zeros(3, 1, dtype=torch.float32)], dim=1))
 
-        # Demosaicing refinement (operates on 3-channel rgb_linear)
+        # Demosaic refinement on linear RGB
         self.demosaic_refine = nn.Sequential(
             nn.Conv2d(3, 32, 3, padding=1),
             nn.GELU(),
             nn.Conv2d(32, 3, 3, padding=1)
         )
 
-        # Chroma extraction with proper color difference (from R,G,B,y)
+        # Chroma extraction (Cr, Cb) using R, G, B, Y
         self.chroma_extractor = nn.Sequential(
             nn.Conv2d(4, 16, 3, padding=1),
             nn.ReLU(inplace=True),
-            nn.Conv2d(16, 2, 3, padding=1),  # Outputs Cr, Cb
+            nn.Conv2d(16, 2, 3, padding=1),
             nn.Tanh()
         )
 
-        # register luminance weights as buffer (BT.709)
+        # BT.709 luminance weights
         self.register_buffer("y_weights", torch.tensor([0.2126, 0.7152, 0.0722], dtype=torch.float32))
 
     def forward(self, x):
         # x: [B,4,H,W] (R, G1, G2, B)
 
-        # Apply white balance
-        wb_x = x * self.wb_gains.view(1, 4, 1, 1)
+        # Positive WB gains to avoid color sign flips
+        gains = F.softplus(self.wb_gains) + 1e-6
+        wb_x = x * gains.view(1, 4, 1, 1)
 
-        # Simple linear demosaic (pack -> RGB) before color matrix
+        # Linear demosaic (pack -> RGB) before color matrix
         r = wb_x[:, 0:1]
         g = 0.5 * (wb_x[:, 1:2] + wb_x[:, 2:3])
         b = wb_x[:, 3:4]
         rgb = torch.cat([r, g, b], dim=1)  # [B,3,H,W]
 
-        # Apply 3x3 color matrix + bias via matmul (correct)
-        # rgb: [B,3,H,W] -> permute to [B,H,W,3] for matrix mul
-        rgb_perm = rgb.permute(0, 2, 3, 1)  # [B,H,W,3]
-        M = self.color_matrix[:, :3]       # [3,3]
-        bias = self.color_matrix[:, 3].view(1, 1, 1, 3)  # [1,1,1,3]
-        rgb_lin = torch.matmul(rgb_perm, M.t()) + bias  # [B,H,W,3]
-        rgb_linear = rgb_lin.permute(0, 3, 1, 2)        # [B,3,H,W]
+        # Apply 3x3 color matrix + bias
+        rgb_perm = rgb.permute(0, 2, 3, 1)                # [B,H,W,3]
+        M    = self.color_matrix[:, :3]                   # [3,3]
+        bias = self.color_matrix[:, 3].view(1, 1, 1, 3)   # [1,1,1,3]
+        rgb_lin = torch.matmul(rgb_perm, M.t()) + bias    # [B,H,W,3]
+        rgb_linear = rgb_lin.permute(0, 3, 1, 2).contiguous()
 
-        # Luminance (BT.709), normalized per-image for stability
-        y = torch.sum(rgb_linear * self.y_weights.view(1, 3, 1, 1), dim=1, keepdim=True)  # [B,1,H,W]
+        # Luminance (normalized per-image to stabilize training)
+        y = torch.sum(rgb_linear * self.y_weights.view(1, 3, 1, 1), dim=1, keepdim=True)
         y = y / (y.amax(dim=(2, 3), keepdim=True).clamp_min(self.eps))
 
-        # Proper chroma components (learned deltas)
-        chroma_input = torch.cat([r, g, b, y], dim=1)         # [B,4,H,W]
-        chroma = self.chroma_extractor(chroma_input)
+        # Chroma (learned)
+        chroma_in = torch.cat([r, g, b, y], dim=1)
+        chroma = self.chroma_extractor(chroma_in)
         cr, cb = chroma[:, 0:1], chroma[:, 1:2]
 
-        # refine demosaic using rgb_linear as input
+        # Demosaic refinement (residual)
         refined_rgb = rgb_linear + self.demosaic_refine(rgb_linear)
 
         return y, cr, cb, refined_rgb
@@ -137,17 +140,17 @@ class CameraAwareColorCorrection(nn.Module):
     def __init__(self, out_channels=3):
         super().__init__()
 
-        # Learnable gamma correction (keep positive via softplus)
+        # Positive gamma
         self.gamma_param = nn.Parameter(torch.tensor(2.2, dtype=torch.float32))
 
-        # Color transformation matrix (small 1x1 conv MLP)
+        # Color transform (1x1 MLP)
         self.color_transform = nn.Sequential(
             nn.Conv2d(out_channels, 64, 1),
             nn.ReLU(inplace=True),
             nn.Conv2d(64, out_channels, 1)
         )
 
-        # Tone curve adjustment (per-channel implemented as 1x1 maps)
+        # Tone curve per-channel (outputs multiplicative modulation in [0.8, 1.2])
         self.tone_curve = nn.Sequential(
             nn.Conv2d(1, 32, 1),
             nn.ReLU(inplace=True),
@@ -157,22 +160,21 @@ class CameraAwareColorCorrection(nn.Module):
 
     def forward(self, x):
         # x: [B,3,H,W]
-        # Apply gamma correction (safe range)
         gamma = F.softplus(self.gamma_param) + 1e-6
-        x_corrected = torch.pow(torch.clamp(x, 0, 1), 1.0 / gamma)
+        x = torch.pow(torch.clamp(x, 0, 1), 1.0 / gamma)
 
-        # Apply color transformation
-        x_transformed = self.color_transform(x_corrected)
+        x = self.color_transform(x)
 
-        # Apply tone curve per channel (vectorized)
-        tone_adjusted = []
-        for i in range(x_transformed.shape[1]):
-            channel = x_transformed[:, i:i+1]
-            adjusted = self.tone_curve(channel)
-            tone_adjusted.append(adjusted)
+        # Apply per-channel tone curve multiplicatively (preserves structure/details)
+        out_ch = []
+        for i in range(x.shape[1]):
+            ch = x[:, i:i+1]
+            mod = self.tone_curve(ch)                   # [0,1]
+            scale = 0.8 + 0.4 * mod                     # [0.8,1.2]
+            out_ch.append(torch.clamp(ch * scale, 0, 1))
+        x = torch.cat(out_ch, dim=1)
 
-        x_final = torch.cat(tone_adjusted, dim=1)
-        return torch.clamp(x_final, 0, 1)
+        return torch.clamp(x, 0, 1)
 
 # -----------------------
 # Enhanced FLCA with Color Awareness (with pyramid)
@@ -247,20 +249,14 @@ class EnhancedFLCA(nn.Module):
         # Build pyramid
         lows, highs = self._pyramid_y(y)  # lists length = self.levels
 
-        # Choose guidance signals:
-        # - use the deepest LL as the stable low-frequency anchor
-        # - aggregate high-frequency magnitudes across levels (simple average)
+        # Guidance signals
         y_low = lows[-1]
         hf_resized = [F.interpolate(h, size=(Hf, Wf), mode='bilinear', align_corners=False) for h in highs]
-        if len(hf_resized) > 1:
-            y_high = torch.stack(hf_resized, dim=0).mean(dim=0)
-        else:
-            y_high = hf_resized[0]
+        y_high = torch.stack(hf_resized, dim=0).mean(dim=0) if len(hf_resized) > 1 else hf_resized[0]
 
         # Resize guidance to feature map size
         y_resized   = F.interpolate(y,        size=(Hf, Wf), mode='bilinear', align_corners=False)
         y_low       = F.interpolate(y_low,    size=(Hf, Wf), mode='bilinear', align_corners=False)
-        y_high      = y_high  # already resized and averaged
         cr_resized  = F.interpolate(cr,       size=(Hf, Wf), mode='bilinear', align_corners=False)
         cb_resized  = F.interpolate(cb,       size=(Hf, Wf), mode='bilinear', align_corners=False)
         rgb_resized = F.interpolate(rgb_guide, size=(Hf, Wf), mode='bilinear', align_corners=False)
@@ -279,9 +275,9 @@ class EnhancedFLCA(nn.Module):
         spatial = 1.0 + color_attn + freq_attn
         x = feat * spatial
 
-        # small residual projection to allow subtle corrections
+        # Residual projection (clamped for stability)
         raw_res = self.res_proj(x)
-        res = torch.tanh(raw_res) * 0.2  # clamp magnitude
+        res = torch.tanh(raw_res) * 0.2
         x = x + res
 
         # Channel attention
@@ -555,10 +551,11 @@ def visualize_color_stats(tensor, name=""):
 # quick check
 # -----------------------
 if __name__ == "__main__":
+    torch.manual_seed(0)
     model = TrueColorRawFormer(dim=48, flca_levels=2)
 
-    # Test with sample input
-    sample_input = torch.randn(1, 1, 512, 512)
+    # Test with sample input (non-negative to mimic raw)
+    sample_input = torch.rand(1, 1, 512, 512)
     output = model(sample_input)
 
     print(f"Input shape: {sample_input.shape}")
