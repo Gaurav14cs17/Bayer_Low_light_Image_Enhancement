@@ -1,22 +1,5 @@
 import pyiqa
 import torch
-
-# list all available metrics
-print(pyiqa.list_models())
-
-device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
-iqa_metric = pyiqa.create_metric('lpips', device=device)
-print(iqa_metric.lower_better)
-
-# example for iqa score inference
-# Tensor inputs, img_tensor_x/y: (N, 3, H, W), RGB, 0 ~ 1
-img_tensor_x = torch.randn(( 1 , 3 , 256 , 256))
-img_tensor_y = torch.randn(( 1 , 3 , 256 , 256))
-score_fr = iqa_metric(img_tensor_x, img_tensor_y)
-
-
-
-import torch
 from torch.utils.data import DataLoader
 from skimage.metrics import peak_signal_noise_ratio as PSNR
 from skimage.metrics import structural_similarity as SSIM
