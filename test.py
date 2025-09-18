@@ -1,3 +1,21 @@
+import pyiqa
+import torch
+
+# list all available metrics
+print(pyiqa.list_models())
+
+device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
+iqa_metric = pyiqa.create_metric('lpips', device=device)
+print(iqa_metric.lower_better)
+
+# example for iqa score inference
+# Tensor inputs, img_tensor_x/y: (N, 3, H, W), RGB, 0 ~ 1
+img_tensor_x = torch.randn(( 1 , 3 , 256 , 256))
+img_tensor_y = torch.randn(( 1 , 3 , 256 , 256))
+score_fr = iqa_metric(img_tensor_x, img_tensor_y)
+
+
+
 import torch
 from torch.utils.data import DataLoader
 from skimage.metrics import peak_signal_noise_ratio as PSNR
@@ -97,8 +115,11 @@ if __name__ == '__main__':
     # ------------------------------
     # Testing loop
     # ------------------------------
+    iqa_metric = pyiqa.create_metric('lpips', device=device)
+    
     psnr_val_rgb = []
     ssim_val_rgb = []
+    lpips_val_rgb = []
 
     os.makedirs(save_images_file, exist_ok=True)
     os.makedirs(save_csv_file, exist_ok=True)
@@ -122,9 +143,12 @@ if __name__ == '__main__':
             # Metrics
             psnr = PSNR(pred_rgb, rgb_gt)
             ssim = SSIM(pred_rgb, rgb_gt, channel_axis=-1)
+            score_fr = iqa_metric(pred_rgb, rgb_gt)
+            
             print(f'image:{ii}\tPSNR:{psnr:.4f}\tSSIM:{ssim:.4f}')
             psnr_val_rgb.append(psnr)
             ssim_val_rgb.append(ssim)
+            lpips_val_rgb.append(score_fr)
 
             # Save images
             imageio.imwrite(os.path.join(save_images_file, f'e{epoch}_{ii}_gt.jpg'), rgb_gt)
@@ -135,9 +159,11 @@ if __name__ == '__main__':
     # ------------------------------
     psnr_average = np.mean(psnr_val_rgb)
     ssim_average = np.mean(ssim_val_rgb)
+    ssim_average = np.mean(lpips_val_rgb)
     print(f"Average PSNR: {psnr_average:.4f}, Average SSIM: {ssim_average:.4f}")
 
     # Save CSV
     np.savetxt(os.path.join(save_csv_file, 'test_metrics.csv'),
                np.column_stack((psnr_val_rgb, ssim_val_rgb)),
                delimiter=',', fmt='%.4f')
+
